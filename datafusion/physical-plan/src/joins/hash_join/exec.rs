@@ -1806,27 +1806,73 @@ impl CollectLeftAccumulator {
     }
 }
 
-/// State for collecting the build-side data during hash join
-struct BuildSideState {
+/// One partition's worth of accumulated build-side input.
+///
+/// In single-partition mode (`BuildSideState::num_partitions == 1`,
+/// the default) there is exactly one of these holding all build
+/// batches, structurally identical to the pre-PR2 flat
+/// `Vec<RecordBatch>`. In partitioned mode (gated by
+/// `hash_join_spill_threshold > 0.0` in PR3+) there is one slot
+/// per hash bucket and the slot becomes the unit of spill.
+#[derive(Debug, Default)]
+struct BuildPartition {
     batches: Vec<RecordBatch>,
     num_rows: usize,
+}
+
+impl BuildPartition {
+    fn push(&mut self, batch: RecordBatch) {
+        self.num_rows += batch.num_rows();
+        self.batches.push(batch);
+    }
+}
+
+/// State for collecting the build-side data during hash join.
+///
+/// Holds `num_partitions` slots of [`BuildPartition`]. The default
+/// is a single slot, behaviorally and structurally equivalent to
+/// the previous flat-vector implementation. Multi-partition mode is
+/// activated when `hash_join_spill_threshold > 0.0` and is the
+/// foundation for the partitioned-spill path.
+struct BuildSideState {
+    /// Per-partition accumulated batches. Length = `num_partitions`.
+    partitions: Vec<BuildPartition>,
+    /// Number of build partitions. `1` preserves legacy behavior.
+    num_partitions: usize,
+    /// Join keys, used to hash-route batches across partitions.
+    on_left: Vec<Arc<dyn PhysicalExpr>>,
+    /// Random state for hash-partition routing. Independent of the
+    /// join's main `random_state` to avoid coupling partition
+    /// assignment to the build's internal hash-table seed.
+    partition_random_state: RandomState,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
     bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
 }
 
 impl BuildSideState {
-    /// Create a new BuildSideState with optional accumulators for bounds computation
+    /// Create a new BuildSideState with optional accumulators for bounds computation.
+    ///
+    /// `num_partitions == 1` keeps the legacy single-slot path. Values >1
+    /// activate hash-routing of incoming batches; PR3 will add disk spill
+    /// on top of that.
     fn try_new(
         metrics: BuildProbeJoinMetrics,
         reservation: MemoryReservation,
         on_left: Vec<Arc<dyn PhysicalExpr>>,
         schema: &SchemaRef,
         should_compute_dynamic_filters: bool,
+        num_partitions: usize,
+        partition_random_state: RandomState,
     ) -> Result<Self> {
+        assert!(num_partitions > 0, "num_partitions must be > 0");
+        let mut partitions = Vec::with_capacity(num_partitions);
+        partitions.resize_with(num_partitions, BuildPartition::default);
         Ok(Self {
-            batches: Vec::new(),
-            num_rows: 0,
+            partitions,
+            num_partitions,
+            on_left: on_left.clone(),
+            partition_random_state,
             metrics,
             reservation,
             bounds_accumulators: should_compute_dynamic_filters
@@ -1839,6 +1885,75 @@ impl BuildSideState {
                 .transpose()?,
         })
     }
+
+    /// Total rows accumulated across all partitions.
+    fn num_rows(&self) -> usize {
+        self.partitions.iter().map(|p| p.num_rows).sum()
+    }
+
+    /// Route `batch` into the appropriate partition slot(s).
+    ///
+    /// In single-partition mode this is a direct push to slot 0
+    /// (zero overhead vs the legacy path). In multi-partition mode
+    /// the batch is hash-split via [`partition_batch_by_hash`] and
+    /// each non-empty sub-batch is appended to its slot.
+    fn push_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        if self.num_partitions == 1 {
+            self.partitions[0].push(batch);
+            return Ok(());
+        }
+        let parts = super::partitioned_build::partition_batch_by_hash(
+            &batch,
+            &self.on_left,
+            self.num_partitions,
+            &self.partition_random_state,
+        )?;
+        for (idx, part) in parts.into_iter().enumerate() {
+            if let Some(b) = part {
+                self.partitions[idx].push(b);
+            }
+        }
+        Ok(())
+    }
+
+    /// Flatten partitions into a single `Vec<RecordBatch>` in
+    /// deterministic partition-major order. In single-partition mode
+    /// this returns the slot's batches verbatim.
+    fn into_flat_batches(self) -> (Vec<RecordBatch>, FinalizedBuildSide) {
+        let BuildSideState {
+            partitions,
+            num_partitions: _,
+            on_left: _,
+            partition_random_state: _,
+            metrics,
+            reservation,
+            bounds_accumulators,
+        } = self;
+        let mut flat = Vec::with_capacity(partitions.iter().map(|p| p.batches.len()).sum());
+        let mut total_rows = 0usize;
+        for p in partitions {
+            total_rows += p.num_rows;
+            flat.extend(p.batches);
+        }
+        (
+            flat,
+            FinalizedBuildSide {
+                num_rows: total_rows,
+                metrics,
+                reservation,
+                bounds_accumulators,
+            },
+        )
+    }
+}
+
+/// Non-batch fields of [`BuildSideState`] returned alongside the
+/// flattened batches by [`BuildSideState::into_flat_batches`].
+struct FinalizedBuildSide {
+    num_rows: usize,
+    metrics: BuildProbeJoinMetrics,
+    reservation: MemoryReservation,
+    bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
 }
 
 fn should_collect_min_max_for_perfect_hash(
@@ -1901,12 +2016,30 @@ async fn collect_left_input(
     let should_collect_min_max_for_phj =
         should_collect_min_max_for_perfect_hash(&on_left, &schema)?;
 
+    // Partitioned-build configuration. `num_partitions == 1` (the
+    // default unless `hash_join_spill_threshold > 0.0`) preserves
+    // the legacy single-batch-vector behavior bit-for-bit; >1
+    // hash-routes incoming batches into per-partition slots in
+    // preparation for PR3's disk-spill path.
+    let exec_opts = &config.execution;
+    let num_build_partitions = if exec_opts.hash_join_spill_threshold > 0.0 {
+        exec_opts.hash_join_num_partitions.max(1)
+    } else {
+        1
+    };
+    // Use a fixed-seed RandomState for partition routing so the
+    // assignment is deterministic across runs and independent of
+    // the join's main-table hash seed.
+    let partition_random_state = RandomState::with_seed(0);
+
     let initial = BuildSideState::try_new(
         metrics,
         reservation,
         on_left.clone(),
         &schema,
         should_compute_dynamic_filters || should_collect_min_max_for_phj,
+        num_build_partitions,
+        partition_random_state,
     )?;
 
     let state = left_stream
@@ -1918,30 +2051,30 @@ async fn collect_left_input(
                 }
             }
 
-            // Decide if we spill or not
-            let batch_size = get_record_batch_memory_size(&batch);
             // Reserve memory for incoming batch
+            let batch_size = get_record_batch_memory_size(&batch);
             state.reservation.try_grow(batch_size)?;
             // Update metrics
             state.metrics.build_mem_used.add(batch_size);
             state.metrics.build_input_batches.add(1);
             state.metrics.build_input_rows.add(batch.num_rows());
-            // Update row count
-            state.num_rows += batch.num_rows();
-            // Push batch to output
-            state.batches.push(batch);
+            // Hash-route into partition slots (single-partition mode
+            // is a no-op fast path).
+            state.push_batch(batch)?;
             Ok(state)
         })
         .await?;
 
-    // Extract fields from state
-    let BuildSideState {
-        batches,
+    // Flatten partitions into a single batch list. In single-partition
+    // mode this is verbatim the previously-collected `Vec<RecordBatch>`;
+    // in multi-partition mode it is the partition-major concatenation.
+    let (batches, finalized) = state.into_flat_batches();
+    let FinalizedBuildSide {
         num_rows,
         metrics,
         mut reservation,
         bounds_accumulators,
-    } = state;
+    } = finalized;
 
     // Compute bounds
     let mut bounds = match bounds_accumulators {
@@ -2602,6 +2735,105 @@ mod tests {
         assert_join_metrics!(metrics, 3);
         assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
 
+        Ok(())
+    }
+
+    /// PR2 sanity: with `hash_join_spill_threshold > 0.0` the build
+    /// is hash-partitioned across `hash_join_num_partitions` slots
+    /// before being concatenated for probe. The result must be
+    /// identical to the single-partition (default) execution path.
+    #[tokio::test]
+    async fn join_inner_partitioned_build_matches_single_partition() -> Result<()> {
+        // Construct a TaskContext that activates the partitioned-build path.
+        let mut session_config = SessionConfig::default().with_batch_size(8192);
+        session_config.options_mut().execution.hash_join_spill_threshold = 0.5;
+        session_config.options_mut().execution.hash_join_num_partitions = 4;
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(session_config));
+
+        let left = build_table(
+            ("a1", &vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            ("b1", &vec![10, 20, 30, 40, 10, 20, 30, 40]),
+            ("c1", &vec![100, 200, 300, 400, 500, 600, 700, 800]),
+        );
+        let right = build_table(
+            ("a2", &vec![11, 22, 33, 44]),
+            ("b1", &vec![10, 20, 30, 40]),
+            ("c2", &vec![1000, 2000, 3000, 4000]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let (columns, batches, _metrics) = join_collect(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on.clone(),
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            task_ctx,
+        )
+        .await?;
+
+        assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
+        // Each left row matches exactly one right row by b1; result has 8 rows.
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 8);
+        assert_snapshot!(batches_to_sort_string(&batches), @r"
+        +----+----+-----+----+----+------+
+        | a1 | b1 | c1  | a2 | b1 | c2   |
+        +----+----+-----+----+----+------+
+        | 1  | 10 | 100 | 11 | 10 | 1000 |
+        | 2  | 20 | 200 | 22 | 20 | 2000 |
+        | 3  | 30 | 300 | 33 | 30 | 3000 |
+        | 4  | 40 | 400 | 44 | 40 | 4000 |
+        | 5  | 10 | 500 | 11 | 10 | 1000 |
+        | 6  | 20 | 600 | 22 | 20 | 2000 |
+        | 7  | 30 | 700 | 33 | 30 | 3000 |
+        | 8  | 40 | 800 | 44 | 40 | 4000 |
+        +----+----+-----+----+----+------+
+        ");
+        Ok(())
+    }
+
+    /// PR2 sanity: partitioned-build mode with a partition count that
+    /// does not evenly divide the key space still produces correct
+    /// results. Uses 7 partitions (prime) over a build with 16 rows.
+    #[tokio::test]
+    async fn join_inner_partitioned_build_odd_partition_count() -> Result<()> {
+        let mut session_config = SessionConfig::default().with_batch_size(8192);
+        session_config.options_mut().execution.hash_join_spill_threshold = 0.5;
+        session_config.options_mut().execution.hash_join_num_partitions = 7;
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(session_config));
+
+        let keys: Vec<i32> = (0..16).collect();
+        let vals: Vec<i32> = (100..116).collect();
+        let zeros: Vec<i32> = vec![0; 16];
+        let left = build_table(("a1", &keys), ("b1", &keys), ("c1", &vals));
+        let right_keys: Vec<i32> = (0..16).collect();
+        let right_vals: Vec<i32> = (1000..1016).collect();
+        let right =
+            build_table(("a2", &zeros), ("b1", &right_keys), ("c2", &right_vals));
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let (_columns, batches, _metrics) = join_collect(
+            left,
+            right,
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            task_ctx,
+        )
+        .await?;
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 16);
         Ok(())
     }
 

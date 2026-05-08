@@ -497,6 +497,24 @@ config_namespace! {
         /// Support for build_side.num_rows() >= u32::MAX will be added in the future.
         pub perfect_hash_join_min_key_density: f64, default = 0.15
 
+        /// External (spilling) hash join: when the build side exceeds this fraction
+        /// of the available memory pool, the build is partitioned by hash and
+        /// individual partitions may be spilled to disk to keep the join within
+        /// budget.
+        ///
+        /// Default `0.0` disables partitioned/spilling execution and preserves the
+        /// existing single-batch build path. Set to e.g. `0.5` to enable spill once
+        /// the build has consumed >=50% of the pool.
+        ///
+        /// See `hash_join_num_partitions` for the partition count used when this
+        /// is enabled.
+        pub hash_join_spill_threshold: f64, default = 0.0
+
+        /// External hash join partition count. Used only when
+        /// `hash_join_spill_threshold > 0.0`. The build side is hash-partitioned
+        /// into this many buckets; each bucket is independently spillable.
+        pub hash_join_num_partitions: usize, default = 8
+
         /// When set to true, record batches will be examined between each operator and
         /// small batches will be coalesced into larger batches. This is helpful when there
         /// are highly selective filters or joins that could produce tiny output batches. The
