@@ -2136,14 +2136,24 @@ impl BuildSideState {
         Ok(())
     }
 
-    /// Flatten all partitions (in-memory and spilled) into a single
-    /// `Vec<RecordBatch>`.
+    /// Finalize the build side into a per-partition list of
+    /// [`PartitionFinalState`].
     ///
-    /// Spilled partitions are streamed back from disk in this step,
-    /// growing the reservation as their bytes return to RAM. In
-    /// single-partition mode this is a verbatim handoff of
-    /// `partitions[0]`'s batches.
-    async fn into_flat_batches(self) -> Result<(Vec<RecordBatch>, FinalizedBuildSide)> {
+    /// PR4-A scaffolding: the returned `Vec` has one entry per
+    /// build partition (length = `self.num_partitions`). Spilled
+    /// slots are read back from disk *here* and folded into a
+    /// `Resident` entry, exactly as `into_flat_batches` did
+    /// previously, so this is bit-for-bit equivalent to the PR3
+    /// readback path. Future PRs (4-D / probe replay) will add a
+    /// `Spilled` variant that defers readback until probe time;
+    /// stream.rs will then materialize partitions one at a time.
+    ///
+    /// The accompanying [`FinalizedBuildSide`] carries the non-batch
+    /// fields (metrics, reservation, bounds accumulators, total
+    /// rows) so the caller can continue exactly as before.
+    async fn into_partition_finalize(
+        self,
+    ) -> Result<(Vec<PartitionFinalState>, FinalizedBuildSide)> {
         let BuildSideState {
             partitions,
             num_partitions: _,
@@ -2154,13 +2164,16 @@ impl BuildSideState {
             mut reservation,
             bounds_accumulators,
         } = self;
-        let mut flat: Vec<RecordBatch> = Vec::new();
+        let mut out: Vec<PartitionFinalState> = Vec::with_capacity(partitions.len());
         let mut total_rows = 0usize;
         for slot in partitions {
             match slot {
                 PartitionSlot::InMemory(p) => {
                     total_rows += p.num_rows;
-                    flat.extend(p.batches);
+                    out.push(PartitionFinalState::Resident {
+                        batches: p.batches,
+                        num_rows: p.num_rows,
+                    });
                 }
                 PartitionSlot::Spilled {
                     file,
@@ -2179,14 +2192,16 @@ impl BuildSideState {
                     })?;
                     let mut stream = sm.read_spill_as_stream(file, None)?;
                     use futures::StreamExt;
+                    let mut batches = Vec::new();
                     while let Some(batch) = stream.next().await {
-                        flat.push(batch?);
+                        batches.push(batch?);
                     }
+                    out.push(PartitionFinalState::Resident { batches, num_rows });
                 }
             }
         }
         Ok((
-            flat,
+            out,
             FinalizedBuildSide {
                 num_rows: total_rows,
                 metrics,
@@ -2195,6 +2210,49 @@ impl BuildSideState {
             },
         ))
     }
+
+    /// Flatten all partitions (in-memory and spilled) into a single
+    /// `Vec<RecordBatch>`.
+    ///
+    /// Implemented in PR4-A on top of [`Self::into_partition_finalize`]
+    /// to keep the existing single-hashmap probe path bit-for-bit
+    /// equivalent while the per-partition machinery is wired up
+    /// behind the scenes.
+    async fn into_flat_batches(self) -> Result<(Vec<RecordBatch>, FinalizedBuildSide)> {
+        let (partitions, finalized) = self.into_partition_finalize().await?;
+        let mut flat: Vec<RecordBatch> = Vec::new();
+        for p in partitions {
+            match p {
+                PartitionFinalState::Resident { batches, .. } => flat.extend(batches),
+            }
+        }
+        Ok((flat, finalized))
+    }
+}
+
+/// Finalized per-partition build state, returned from
+/// [`BuildSideState::into_partition_finalize`].
+///
+/// PR4-A only emits the `Resident` variant — spilled partitions are
+/// read back into memory at finalize time, preserving PR3's
+/// "build > pool requires probe-time replay" limitation. The enum
+/// shape is in place so PR4-D can introduce a `Spilled` variant
+/// that defers readback until probe time, without further churn at
+/// the call site.
+#[derive(Debug)]
+enum PartitionFinalState {
+    /// Build batches resident in memory, ready to feed the
+    /// hash-table builder. `num_rows` is the sum of
+    /// `batch.num_rows()` across `batches`, cached so callers don't
+    /// have to re-walk the vector.
+    Resident {
+        batches: Vec<RecordBatch>,
+        // PR4-B will read `num_rows` when sizing per-partition
+        // hash maps and visited-indices bitmaps. Allowed dead in
+        // PR4-A so the scaffolding lands without churn.
+        #[allow(dead_code)]
+        num_rows: usize,
+    },
 }
 
 /// Non-batch fields of [`BuildSideState`] returned alongside the
