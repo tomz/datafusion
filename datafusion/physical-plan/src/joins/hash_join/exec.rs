@@ -193,16 +193,14 @@ fn try_create_array_map(
 
 /// Per-partition build-side state that the probe path consumes.
 ///
-/// PR4-B introduces this struct as the unit of work that
-/// [`super::stream::HashJoinStream`] will eventually iterate over
-/// (one partition at a time, see PR4-C). Today every
-/// [`JoinLeftData`] holds exactly one entry, so all accessors on
-/// `JoinLeftData` (`map`, `batch`, `values`, `visited_indices_bitmap`)
-/// delegate straight to `partitions[0]` and the probe path is
-/// bit-for-bit identical to PR3.
-///
-/// Multi-partition population happens in PR4-C/D when the build
-/// side stops collapsing into a single concatenated batch.
+/// One unit of work that [`super::stream::HashJoinStream`]
+/// iterates over (one partition at a time, see PR4-C). PR4-D-3a
+/// drops the previous PR4-B invariant that there is always
+/// exactly one entry: accessors on [`JoinLeftData`] now take a
+/// `partition_idx` and the probe state machine threads
+/// `BuildSideReadyState::current_partition` through them. Today
+/// the build path still produces a single partition; PR4-D-3b
+/// fans out to N partitions and adds the probe-replay loop.
 pub(super) struct JoinLeftPartitionData {
     /// Hash table over `values`, indexed into `batch`.
     /// `Arc` because [`SharedBuildAccumulator`] may share it for
@@ -218,20 +216,63 @@ pub(super) struct JoinLeftPartitionData {
     /// a single global bitmap.
     visited_indices_bitmap: SharedBitmapBuilder,
     /// Per-partition min/max bounds for dynamic-filter pushdown.
-    /// PR4-B keeps a single partition so this is equal to the
-    /// parent [`JoinLeftData::bounds`]; PR4-C will fan out and
+    /// PR4-D-3a keeps a single partition so this is equal to the
+    /// parent [`JoinLeftData::bounds`]; PR4-D-3b will fan out and
     /// the parent will hold the union.
     #[allow(dead_code)]
     pub(super) bounds: Option<PartitionBounds>,
 }
 
+/// One slot in [`JoinLeftData::partitions`].
+///
+/// PR4-D-3a introduces the enum so the probe state machine has
+/// a stable shape that can carry both already-built partitions
+/// and partitions still on disk. Today `collect_left_input`
+/// always produces a single `Resident` slot; PR4-D-3b is what
+/// actually emits `Spilled` entries and adds the readback /
+/// hash-map build path that turns them into `Resident`.
+pub(super) enum PartitionEntry {
+    /// Hash map + batch + bitmap are in memory and ready to probe.
+    Resident(JoinLeftPartitionData),
+    /// Build batches still on disk. The reservation has *not*
+    /// been regrown; whoever materializes this slot is responsible
+    /// for `reservation.try_grow(bytes)` before reading the spill
+    /// file back.
+    ///
+    /// `spill_manager` is held here so the probe-time
+    /// `MaterializePartition` step can read the slot back without
+    /// holding a borrow on the rest of the build state.
+    #[allow(dead_code)]
+    Spilled {
+        file: RefCountedTempFile,
+        num_rows: usize,
+        bytes: usize,
+        spill_manager: Arc<SpillManager>,
+    },
+}
+
 /// HashTable and input data for the left (build side) of a join
 pub(super) struct JoinLeftData {
-    /// Per-partition build state. Length ≥ 1; today always 1
-    /// (PR4-B preserves PR3's single-hashmap probe path).
-    /// Future PRs will add partitions here when
-    /// `hash_join_num_partitions > 1`.
-    partitions: Vec<JoinLeftPartitionData>,
+    /// Per-partition build state. Length = [`Self::num_partitions`]
+    /// (≥ 1). Today always 1; PR4-D-3b populates the multi-partition
+    /// case.
+    partitions: Vec<PartitionEntry>,
+    /// Number of build partitions. Cached so `num_partitions()`
+    /// stays cheap and survives `Spilled` slots being swapped in
+    /// place during probe-time materialization.
+    num_partitions: usize,
+    /// Random state used for partition routing on the probe side.
+    /// MUST match the build-side `BuildSideState::partition_random_state`,
+    /// otherwise build/probe end up in different partitions. Carried
+    /// here so [`super::stream::HashJoinStream`] can hash-route
+    /// probe batches identically in PR4-D-3b.
+    #[allow(dead_code)]
+    pub(super) partition_random_state: RandomState,
+    /// Spill manager used to read [`PartitionEntry::Spilled`] slots
+    /// back from disk during probe-time materialization. `None`
+    /// when build ran in single-partition mode (no spill).
+    #[allow(dead_code)]
+    pub(super) spill_manager: Option<Arc<SpillManager>>,
     /// Counter of running probe-threads, potentially
     /// able to update `visited_indices_bitmap`
     probe_threads_counter: AtomicUsize,
@@ -242,7 +283,7 @@ pub(super) struct JoinLeftData {
     _reservation: MemoryReservation,
     /// Aggregated bounds across all partitions, used for dynamic
     /// filter pushdown. With a single partition this equals
-    /// `partitions[0].bounds`; PR4-C+ will compute the union.
+    /// `partitions[0].bounds`; PR4-D-3b will compute the union.
     /// `None` when the build side is empty.
     pub(super) bounds: Option<PartitionBounds>,
     /// Membership testing strategy for filter pushdown
@@ -256,39 +297,44 @@ pub(super) struct JoinLeftData {
 }
 
 impl JoinLeftData {
-    /// Returns the single build partition.
+    /// Returns the resident build partition at `partition_idx`.
     ///
-    /// Asserts in debug builds that exactly one partition is
-    /// present — PR4-B guarantees this; PR4-C will replace each
-    /// caller with a partition-aware path before the invariant
-    /// is relaxed.
-    fn single_partition(&self) -> &JoinLeftPartitionData {
-        debug_assert_eq!(
-            self.partitions.len(),
-            1,
-            "PR4-B: single-partition probe path requires exactly one build partition"
-        );
-        &self.partitions[0]
+    /// Panics if the slot is currently `Spilled`. PR4-D-3b
+    /// guarantees that the probe state machine only calls this
+    /// after `MaterializePartition` has turned the slot into
+    /// `Resident`; today every slot starts as `Resident` so the
+    /// invariant holds trivially.
+    fn partition(&self, partition_idx: usize) -> &JoinLeftPartitionData {
+        match &self.partitions[partition_idx] {
+            PartitionEntry::Resident(p) => p,
+            PartitionEntry::Spilled { .. } => panic!(
+                "BUG: probe path accessed build partition {partition_idx} while still spilled; \
+                 MaterializePartition must run first"
+            ),
+        }
     }
 
-    /// return a reference to the map
-    pub(super) fn map(&self) -> &Map {
-        &self.single_partition().map
+    /// return a reference to the map for `partition_idx`.
+    pub(super) fn map(&self, partition_idx: usize) -> &Map {
+        &self.partition(partition_idx).map
     }
 
-    /// returns a reference to the build side batch
-    pub(super) fn batch(&self) -> &RecordBatch {
-        &self.single_partition().batch
+    /// returns a reference to the build side batch for `partition_idx`.
+    pub(super) fn batch(&self, partition_idx: usize) -> &RecordBatch {
+        &self.partition(partition_idx).batch
     }
 
-    /// returns a reference to the build side expressions values
-    pub(super) fn values(&self) -> &[ArrayRef] {
-        &self.single_partition().values
+    /// returns a reference to the build side expressions values for `partition_idx`.
+    pub(super) fn values(&self, partition_idx: usize) -> &[ArrayRef] {
+        &self.partition(partition_idx).values
     }
 
-    /// returns a reference to the visited indices bitmap
-    pub(super) fn visited_indices_bitmap(&self) -> &SharedBitmapBuilder {
-        &self.single_partition().visited_indices_bitmap
+    /// returns a reference to the visited indices bitmap for `partition_idx`.
+    pub(super) fn visited_indices_bitmap(
+        &self,
+        partition_idx: usize,
+    ) -> &SharedBitmapBuilder {
+        &self.partition(partition_idx).visited_indices_bitmap
     }
 
     /// returns a reference to the InList values for filter pushdown
@@ -304,22 +350,22 @@ impl JoinLeftData {
 
     /// Number of build partitions held by this `JoinLeftData`.
     ///
-    /// PR4-B/C scaffolding: always returns 1 today. PR4-D will
-    /// return the actual partition count once the build side
-    /// stops collapsing into a single concatenated batch.
+    /// Today always 1. PR4-D-3b returns the actual partition
+    /// count once the build side stops collapsing into a single
+    /// concatenated batch.
     pub(super) fn num_partitions(&self) -> usize {
-        self.partitions.len()
+        self.num_partitions
     }
 
-    /// Borrow the shared `Arc<Map>` for the single build partition.
+    /// Borrow the shared `Arc<Map>` for the build partition at
+    /// `partition_idx`.
     ///
     /// Used by [`SharedBuildAccumulator`] to share the build-side
     /// hash table for filter pushdown without cloning the table
-    /// data itself. PR4-C will replace this with a partition-aware
-    /// API once probe walks one partition at a time.
+    /// data itself.
     #[allow(dead_code)]
-    pub(super) fn map_arc(&self) -> &Arc<Map> {
-        &self.single_partition().map
+    pub(super) fn map_arc(&self, partition_idx: usize) -> &Arc<Map> {
+        &self.partition(partition_idx).map
     }
 }
 
@@ -2479,6 +2525,13 @@ async fn collect_left_input(
         None
     };
 
+    // Clones for JoinLeftData; build-side moves the originals into
+    // BuildSideState. The probe-side hash router (PR4-D-3b) MUST use
+    // the same `partition_random_state` instance (same seed) so build
+    // and probe agree on partition assignment.
+    let join_left_partition_random_state = partition_random_state.clone();
+    let join_left_spill_manager = spill_manager.clone();
+
     let initial = BuildSideState::try_new(
         metrics,
         reservation,
@@ -2654,17 +2707,23 @@ async fn collect_left_input(
     }
 
     let data = JoinLeftData {
-        partitions: vec![JoinLeftPartitionData {
+        partitions: vec![PartitionEntry::Resident(JoinLeftPartitionData {
             map,
             batch,
             values: left_values,
             visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
-            // PR4-B: per-partition bounds equal the parent
-            // aggregated bounds today (single partition); PR4-C
+            // PR4-D-3a: per-partition bounds equal the parent
+            // aggregated bounds today (single partition); PR4-D-3b
             // will populate each partition independently and the
             // parent will hold the union for filter pushdown.
             bounds: bounds.clone(),
-        }],
+        })],
+        // PR4-D-3a always builds a single resident partition (legacy
+        // behavior); the multi-partition build fan-out arrives in
+        // PR4-D-3b alongside the probe-replay loop.
+        num_partitions: 1,
+        partition_random_state: join_left_partition_random_state,
+        spill_manager: join_left_spill_manager,
         probe_threads_counter: AtomicUsize::new(probe_threads_count),
         _reservation: reservation,
         bounds,

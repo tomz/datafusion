@@ -633,7 +633,8 @@ impl HashJoinStream {
         // `map()`, `batch()`, `values()`, `visited_indices_bitmap()` —
         // which delegate to `partitions[0]`. PR4-D will switch
         // these to take a partition index.
-        if build_side.left_data.map().is_empty()
+        let partition_idx = build_side.current_partition;
+        if build_side.left_data.map(partition_idx).is_empty()
             && self.join_type.empty_build_side_produces_empty_result()
         {
             self.state = HashJoinStreamState::Completed;
@@ -719,7 +720,10 @@ impl HashJoinStream {
                 // Precalculate hash values for fetched batch
                 let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
 
-                if let Map::HashMap(_) = self.build_side.try_as_ready()?.left_data.map() {
+                let build_side = self.build_side.try_as_ready()?;
+                if let Map::HashMap(_) =
+                    build_side.left_data.map(build_side.current_partition)
+                {
                     self.hashes_buffer.clear();
                     self.hashes_buffer.resize(batch.num_rows(), 0);
                     create_hashes(
@@ -754,6 +758,7 @@ impl HashJoinStream {
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         let state = self.state.try_as_process_probe_batch_mut()?;
         let build_side = self.build_side.try_as_ready_mut()?;
+        let partition_idx = build_side.current_partition;
 
         self.join_metrics
             .probe_hit_rate
@@ -801,7 +806,7 @@ impl HashJoinStream {
 
         // If the build side is empty, this stream only reaches ProcessProbeBatch for
         // join types whose output still depends on probe rows.
-        let is_empty = build_side.left_data.map().is_empty();
+        let is_empty = build_side.left_data.map(partition_idx).is_empty();
 
         if is_empty {
             // Invariant: state_after_build_ready should have already completed
@@ -809,7 +814,7 @@ impl HashJoinStream {
             debug_assert!(!self.join_type.empty_build_side_produces_empty_result());
             let result = build_batch_empty_build_side(
                 &self.schema,
-                build_side.left_data.batch(),
+                build_side.left_data.batch(partition_idx),
                 &state.batch,
                 &self.column_indices,
                 self.join_type,
@@ -822,11 +827,11 @@ impl HashJoinStream {
         }
 
         // get the matched by join keys indices
-        let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
+        let (left_indices, right_indices, next_offset) = match build_side.left_data.map(partition_idx)
         {
             Map::HashMap(map) => lookup_join_hashmap(
                 map.as_ref(),
-                build_side.left_data.values(),
+                build_side.left_data.values(partition_idx),
                 &state.values,
                 self.null_equality,
                 &self.hashes_buffer,
@@ -866,7 +871,7 @@ impl HashJoinStream {
         // apply join filter if exists
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
             apply_join_filter_to_indices(
-                build_side.left_data.batch(),
+                build_side.left_data.batch(partition_idx),
                 &state.batch,
                 left_indices,
                 right_indices,
@@ -881,7 +886,7 @@ impl HashJoinStream {
 
         // mark joined left-side indices as visited, if required by join type
         if need_produce_result_in_final(self.join_type) {
-            let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
+            let mut bitmap = build_side.left_data.visited_indices_bitmap(partition_idx).lock();
             left_indices.iter().flatten().for_each(|x| {
                 bitmap.set_bit(x as usize, true);
             });
@@ -929,9 +934,9 @@ impl HashJoinStream {
         // Build output batch and push to coalescer
         let (build_batch, probe_batch, join_side) =
             if self.join_type == JoinType::RightMark {
-                (&state.batch, build_side.left_data.batch(), JoinSide::Right)
+                (&state.batch, build_side.left_data.batch(partition_idx), JoinSide::Right)
             } else {
-                (build_side.left_data.batch(), &state.batch, JoinSide::Left)
+                (build_side.left_data.batch(partition_idx), &state.batch, JoinSide::Left)
             };
 
         let batch = build_batch_from_indices(
@@ -983,6 +988,7 @@ impl HashJoinStream {
         }
 
         let build_side = self.build_side.try_as_ready()?;
+        let partition_idx = build_side.current_partition;
 
         // For null-aware anti join, if probe side had NULL, no rows should be output
         // Check shared atomic state to get global knowledge across all partitions
@@ -1003,7 +1009,7 @@ impl HashJoinStream {
 
         // use the global left bitmap to produce the left indices and right indices
         let (mut left_side, mut right_side) = get_final_indices_from_shared_bitmap(
-            build_side.left_data.visited_indices_bitmap(),
+            build_side.left_data.visited_indices_bitmap(partition_idx),
             self.join_type,
             true,
         );
@@ -1020,7 +1026,7 @@ impl HashJoinStream {
                 .load(Ordering::Relaxed)
         {
             // Since null_aware validation ensures single column join, we only check the first column
-            let build_key_column = &build_side.left_data.values()[0];
+            let build_key_column = &build_side.left_data.values(partition_idx)[0];
 
             // Filter out indices where the key is NULL
             let filtered_indices: Vec<u64> = left_side
@@ -1055,7 +1061,7 @@ impl HashJoinStream {
             let empty_right_batch = RecordBatch::new_empty(self.right.schema());
             let batch = build_batch_from_indices(
                 &self.schema,
-                build_side.left_data.batch(),
+                build_side.left_data.batch(partition_idx),
                 &empty_right_batch,
                 &left_side,
                 &right_side,
