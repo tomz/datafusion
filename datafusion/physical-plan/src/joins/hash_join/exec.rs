@@ -191,17 +191,46 @@ fn try_create_array_map(
     Ok(Some((array_map, batch, left_values)))
 }
 
+/// Per-partition build-side state that the probe path consumes.
+///
+/// PR4-B introduces this struct as the unit of work that
+/// [`super::stream::HashJoinStream`] will eventually iterate over
+/// (one partition at a time, see PR4-C). Today every
+/// [`JoinLeftData`] holds exactly one entry, so all accessors on
+/// `JoinLeftData` (`map`, `batch`, `values`, `visited_indices_bitmap`)
+/// delegate straight to `partitions[0]` and the probe path is
+/// bit-for-bit identical to PR3.
+///
+/// Multi-partition population happens in PR4-C/D when the build
+/// side stops collapsing into a single concatenated batch.
+pub(super) struct JoinLeftPartitionData {
+    /// Hash table over `values`, indexed into `batch`.
+    /// `Arc` because [`SharedBuildAccumulator`] may share it for
+    /// hash-map filter pushdown.
+    pub(super) map: Arc<Map>,
+    /// Concatenated build-side rows for this partition.
+    batch: RecordBatch,
+    /// Pre-evaluated join-key arrays for this partition.
+    values: Vec<ArrayRef>,
+    /// Visited-row bitmap for outer-join unmatched-row emission,
+    /// length = `batch.num_rows()`. Per-partition so future PRs
+    /// can emit unmatched rows partition-locally without merging
+    /// a single global bitmap.
+    visited_indices_bitmap: SharedBitmapBuilder,
+    /// Per-partition min/max bounds for dynamic-filter pushdown.
+    /// PR4-B keeps a single partition so this is equal to the
+    /// parent [`JoinLeftData::bounds`]; PR4-C will fan out and
+    /// the parent will hold the union.
+    pub(super) bounds: Option<PartitionBounds>,
+}
+
 /// HashTable and input data for the left (build side) of a join
 pub(super) struct JoinLeftData {
-    /// The hash table with indices into `batch`
-    /// Arc is used to allow sharing with SharedBuildAccumulator for hash map pushdown
-    pub(super) map: Arc<Map>,
-    /// The input rows for the build side
-    batch: RecordBatch,
-    /// The build side on expressions values
-    values: Vec<ArrayRef>,
-    /// Shared bitmap builder for visited left indices
-    visited_indices_bitmap: SharedBitmapBuilder,
+    /// Per-partition build state. Length ≥ 1; today always 1
+    /// (PR4-B preserves PR3's single-hashmap probe path).
+    /// Future PRs will add partitions here when
+    /// `hash_join_num_partitions > 1`.
+    partitions: Vec<JoinLeftPartitionData>,
     /// Counter of running probe-threads, potentially
     /// able to update `visited_indices_bitmap`
     probe_threads_counter: AtomicUsize,
@@ -210,9 +239,10 @@ pub(super) struct JoinLeftData {
     /// This could hide potential out-of-memory issues, especially when upstream operators increase their memory consumption.
     /// The MemoryReservation ensures proper tracking of memory resources throughout the join operation's lifecycle.
     _reservation: MemoryReservation,
-    /// Bounds computed from the build side for dynamic filter pushdown.
-    /// If the partition is empty (no rows) this will be None.
-    /// If the partition has some rows this will be Some with the bounds for each join key column.
+    /// Aggregated bounds across all partitions, used for dynamic
+    /// filter pushdown. With a single partition this equals
+    /// `partitions[0].bounds`; PR4-C+ will compute the union.
+    /// `None` when the build side is empty.
     pub(super) bounds: Option<PartitionBounds>,
     /// Membership testing strategy for filter pushdown
     /// Contains either InList values for small build sides or hash table reference for large build sides
@@ -225,24 +255,39 @@ pub(super) struct JoinLeftData {
 }
 
 impl JoinLeftData {
+    /// Returns the single build partition.
+    ///
+    /// Asserts in debug builds that exactly one partition is
+    /// present — PR4-B guarantees this; PR4-C will replace each
+    /// caller with a partition-aware path before the invariant
+    /// is relaxed.
+    fn single_partition(&self) -> &JoinLeftPartitionData {
+        debug_assert_eq!(
+            self.partitions.len(),
+            1,
+            "PR4-B: single-partition probe path requires exactly one build partition"
+        );
+        &self.partitions[0]
+    }
+
     /// return a reference to the map
     pub(super) fn map(&self) -> &Map {
-        &self.map
+        &self.single_partition().map
     }
 
     /// returns a reference to the build side batch
     pub(super) fn batch(&self) -> &RecordBatch {
-        &self.batch
+        &self.single_partition().batch
     }
 
     /// returns a reference to the build side expressions values
     pub(super) fn values(&self) -> &[ArrayRef] {
-        &self.values
+        &self.single_partition().values
     }
 
     /// returns a reference to the visited indices bitmap
     pub(super) fn visited_indices_bitmap(&self) -> &SharedBitmapBuilder {
-        &self.visited_indices_bitmap
+        &self.single_partition().visited_indices_bitmap
     }
 
     /// returns a reference to the InList values for filter pushdown
@@ -254,6 +299,17 @@ impl JoinLeftData {
     /// if caller is the last running thread
     pub(super) fn report_probe_completed(&self) -> bool {
         self.probe_threads_counter.fetch_sub(1, Ordering::Relaxed) == 1
+    }
+
+    /// Borrow the shared `Arc<Map>` for the single build partition.
+    ///
+    /// Used by [`SharedBuildAccumulator`] to share the build-side
+    /// hash table for filter pushdown without cloning the table
+    /// data itself. PR4-C will replace this with a partition-aware
+    /// API once probe walks one partition at a time.
+    #[allow(dead_code)]
+    pub(super) fn map_arc(&self) -> &Arc<Map> {
+        &self.single_partition().map
     }
 }
 
@@ -2533,10 +2589,17 @@ async fn collect_left_input(
     }
 
     let data = JoinLeftData {
-        map,
-        batch,
-        values: left_values,
-        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        partitions: vec![JoinLeftPartitionData {
+            map,
+            batch,
+            values: left_values,
+            visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+            // PR4-B: per-partition bounds equal the parent
+            // aggregated bounds today (single partition); PR4-C
+            // will populate each partition independently and the
+            // parent will hold the union for filter pushdown.
+            bounds: bounds.clone(),
+        }],
         probe_threads_counter: AtomicUsize::new(probe_threads_count),
         _reservation: reservation,
         bounds,
