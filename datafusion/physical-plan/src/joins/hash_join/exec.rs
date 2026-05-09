@@ -3846,6 +3846,89 @@ mod tests {
         Ok(())
     }
 
+    /// PR4-E: outer-join correctness under multi-partition build.
+    ///
+    /// PR4-D-3a moved `visited_indices_bitmap` onto each
+    /// `JoinLeftPartitionData`; PR4-D-3b made
+    /// `process_unmatched_build_batch` iterate every partition's
+    /// bitmap when the join finalizes. This test pins down that
+    /// the emit-all-partitions path matches the single-partition
+    /// output across LEFT, FULL, LeftAnti, and LeftSemi joins.
+    ///
+    /// We run each join shape twice — once at the default config
+    /// (single build partition, PR3 path) and once with
+    /// `hash_join_num_partitions = 4 +
+    /// hash_join_spill_threshold = 0.5` (multi-partition build
+    /// + probe replay) — and assert the result sets match
+    /// modulo ordering.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pr4_outer_joins_match_single_partition() -> Result<()> {
+        // Inputs designed to exercise unmatched rows on both
+        // sides: build has key 7 (no probe match) and probe has
+        // key 6 (no build match).
+        let left = build_table(
+            ("a1", &vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            ("b1", &vec![1, 2, 3, 4, 5, 5, 7, 8]),
+            ("c1", &vec![10, 20, 30, 40, 50, 60, 70, 80]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30, 40, 50, 60]),
+            ("b1", &vec![1, 2, 3, 4, 5, 6]),
+            ("c2", &vec![100, 200, 300, 400, 500, 600]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        fn ctx_single() -> Arc<TaskContext> {
+            Arc::new(TaskContext::default())
+        }
+        fn ctx_multi() -> Arc<TaskContext> {
+            let mut session_config = SessionConfig::default().with_batch_size(8192);
+            session_config.options_mut().execution.hash_join_spill_threshold = 0.5;
+            session_config.options_mut().execution.hash_join_num_partitions = 4;
+            Arc::new(TaskContext::default().with_session_config(session_config))
+        }
+
+        for join_type in [
+            JoinType::Left,
+            JoinType::Full,
+            JoinType::LeftAnti,
+            JoinType::LeftSemi,
+        ] {
+            let (_cols_a, batches_single, _m_a) = join_collect(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                on.clone(),
+                &join_type,
+                NullEquality::NullEqualsNothing,
+                ctx_single(),
+            )
+            .await?;
+            let (_cols_b, batches_multi, _m_b) = join_collect(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                on.clone(),
+                &join_type,
+                NullEquality::NullEqualsNothing,
+                ctx_multi(),
+            )
+            .await?;
+
+            // Compare result sets via sorted string formatting,
+            // which is the established equality check for join
+            // outputs whose row order isn't stable across paths.
+            let a = batches_to_sort_string(&batches_single);
+            let b = batches_to_sort_string(&batches_multi);
+            assert_eq!(
+                a, b,
+                "{join_type:?} multi-partition output diverged from single-partition baseline.\nsingle:\n{a}\nmulti:\n{b}"
+            );
+        }
+        Ok(())
+    }
+
     /// PR3 unit test: directly drive `BuildSideState::spill_largest_in_memory_partition`
     /// and `BuildSideState::into_flat_batches` to verify the spill+readback
     /// roundtrip preserves all batches and rows, independent of the budget
