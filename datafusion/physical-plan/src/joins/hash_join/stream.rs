@@ -29,6 +29,7 @@ use crate::joins::Map;
 use crate::joins::MapOffset;
 use crate::joins::PartitionMode;
 use crate::joins::hash_join::exec::JoinLeftData;
+use crate::joins::hash_join::partitioned_build::partition_batch_by_hash;
 use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
@@ -283,6 +284,31 @@ pub(super) struct HashJoinStream {
     output_buffer: LimitedBatchCoalescer,
     /// Whether this is a null-aware anti join
     null_aware: bool,
+    /// Buffer of upstream probe batches collected during the first
+    /// pass (`current_partition == 0`) and replayed against
+    /// subsequent partitions.
+    ///
+    /// `None` in single-partition mode (the legacy path): probe
+    /// batches stream straight through with zero buffering. `Some`
+    /// in multi-partition mode (PR4-D-3b grace-hash probe replay):
+    /// the first pass appends each fetched batch; later passes
+    /// drain via `probe_buffer_replay_idx`. PR4 v1 buffers in RAM
+    /// to keep the change small; PR5 will spill the probe side.
+    probe_buffer: Option<Vec<RecordBatch>>,
+    /// Cursor into `probe_buffer` for replay passes. Reset to 0
+    /// each time we advance to the next build partition.
+    probe_buffer_replay_idx: usize,
+    /// True once the upstream probe stream has returned `None`.
+    /// In multi-partition mode this gates whether `fetch_probe_batch`
+    /// pulls from upstream or from `probe_buffer`.
+    probe_upstream_exhausted: bool,
+    /// Pending materialize-partition future, owned by this stream
+    /// across `Poll::Pending` returns. Multiple probe streams may
+    /// race on the same `JoinLeftData::materialize_partition`;
+    /// `tokio::sync::OnceCell` inside `SpilledSlot::cell` makes the
+    /// readback idempotent, so each stream just polls its own
+    /// future view of the same shared work.
+    materialize_fut: Option<futures::future::BoxFuture<'static, Result<()>>>,
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -461,6 +487,10 @@ impl HashJoinStream {
             mode,
             output_buffer,
             null_aware,
+            probe_buffer: None,
+            probe_buffer_replay_idx: 0,
+            probe_upstream_exhausted: false,
+            materialize_fut: None,
         }
     }
 
@@ -621,20 +651,20 @@ impl HashJoinStream {
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         let build_side = self.build_side.try_as_ready()?;
         let num_partitions = build_side.left_data.num_partitions();
-        debug_assert!(
-            num_partitions == 1,
-            "PR4-C: only num_partitions == 1 is wired today; PR4-D adds the multi-partition probe loop"
-        );
         if build_side.current_partition >= num_partitions {
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
         }
-        // PR4-C reuses the same flat-`JoinLeftData` accessors —
-        // `map()`, `batch()`, `values()`, `visited_indices_bitmap()` —
-        // which delegate to `partitions[0]`. PR4-D will switch
-        // these to take a partition index.
-        let partition_idx = build_side.current_partition;
-        if build_side.left_data.map(partition_idx).is_empty()
+        // The empty-build-produces-empty-result fast path only
+        // applies when the *entire* build is empty. In
+        // single-partition mode that's equivalent to "the only
+        // build partition is empty"; in multi-partition mode it
+        // would skip valid sibling partitions. Defer to the
+        // post-materialization probe loop in multi-partition mode
+        // — empty partitions just produce no matches.
+        if num_partitions == 1
+            && build_side.left_data.is_resident(0)
+            && build_side.left_data.map(0).is_empty()
             && self.join_type.empty_build_side_produces_empty_result()
         {
             self.state = HashJoinStreamState::Completed;
@@ -656,16 +686,28 @@ impl HashJoinStream {
     /// config.
     fn materialize_partition(
         &mut self,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         let build_side = self.build_side.try_as_ready()?;
-        debug_assert!(
-            build_side.left_data.num_partitions() == 1,
-            "PR4-D-1: only num_partitions == 1 is wired today; PR4-D-2 adds spill readback"
-        );
-        // Resident partition — nothing to materialize. Hash map,
-        // batch, and bitmap are already in RAM via PR4-B's
-        // `JoinLeftPartitionData`.
+        let partition_idx = build_side.current_partition;
+        // Fast path: already resident → just transition.
+        if build_side.left_data.is_resident(partition_idx) {
+            self.state = HashJoinStreamState::FetchProbeBatch;
+            return Poll::Ready(Ok(StatefulStreamResult::Continue));
+        }
+        // Spilled slot: drive the async readback. The future is
+        // built lazily and stored on `self` so we can poll it
+        // across multiple `Poll::Pending` returns.
+        if self.materialize_fut.is_none() {
+            let left_data = Arc::clone(&build_side.left_data);
+            self.materialize_fut = Some(Box::pin(async move {
+                left_data.materialize_partition(partition_idx).await
+            }));
+        }
+        let fut = self.materialize_fut.as_mut().expect("just initialized");
+        let res = ready!(fut.as_mut().poll(cx));
+        self.materialize_fut = None;
+        res?;
         self.state = HashJoinStreamState::FetchProbeBatch;
         Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
@@ -693,12 +735,18 @@ impl HashJoinStream {
 
         self.state = self.transition_after_build_collected(&left_data);
 
+        // PR4-D-3b: enable probe-batch buffering only when the
+        // build is actually multi-partition. Single-partition mode
+        // keeps the zero-overhead direct-pull path.
+        if left_data.num_partitions() > 1 {
+            self.probe_buffer = Some(Vec::new());
+        }
         self.build_side = BuildSide::Ready(BuildSideReadyState {
             left_data,
-            // PR4-C scaffolding: probe always starts at partition 0.
-            // The probe state machine advances `current_partition`
-            // after [`HashJoinStreamState::ExhaustedProbeSide`] when
-            // `num_partitions > 1` (PR4-D); today it stays at 0.
+            // Probe always starts at partition 0; the probe state
+            // machine advances `current_partition` after
+            // [`HashJoinStreamState::ExhaustedProbeSide`] when
+            // `num_partitions > 1` (PR4-D-3b).
             current_partition: 0,
         });
         Poll::Ready(Ok(StatefulStreamResult::Continue))
@@ -712,40 +760,113 @@ impl HashJoinStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
-        match ready!(self.right.poll_next_unpin(cx)) {
-            None => {
+        // Source the next probe batch.
+        //
+        // * Single-partition mode (`probe_buffer == None`): pull
+        //   straight from `self.right`, no buffering. PR3 behavior.
+        // * Multi-partition mode, first pass (`current_partition == 0`,
+        //   upstream not exhausted): pull from `self.right` AND
+        //   append to `probe_buffer` so later passes can replay.
+        // * Multi-partition mode, replay pass (or first pass after
+        //   upstream is drained): take the next entry from
+        //   `probe_buffer[probe_buffer_replay_idx]`.
+        let raw_batch = if self.probe_buffer.is_some() && self.probe_upstream_exhausted {
+            // Replay or finishing first pass after exhaust.
+            let buf = self
+                .probe_buffer
+                .as_ref()
+                .expect("checked Some above");
+            if self.probe_buffer_replay_idx < buf.len() {
+                let b = buf[self.probe_buffer_replay_idx].clone();
+                self.probe_buffer_replay_idx += 1;
+                Some(b)
+            } else {
                 self.state = HashJoinStreamState::ExhaustedProbeSide;
+                return Poll::Ready(Ok(StatefulStreamResult::Continue));
             }
-            Some(Ok(batch)) => {
-                // Precalculate hash values for fetched batch
-                let keys_values = evaluate_expressions_to_arrays(&self.on_right, &batch)?;
-
-                let build_side = self.build_side.try_as_ready()?;
-                if let Map::HashMap(_) =
-                    build_side.left_data.map(build_side.current_partition)
-                {
-                    self.hashes_buffer.clear();
-                    self.hashes_buffer.resize(batch.num_rows(), 0);
-                    create_hashes(
-                        &keys_values,
-                        &self.random_state,
-                        &mut self.hashes_buffer,
-                    )?;
+        } else {
+            match ready!(self.right.poll_next_unpin(cx)) {
+                None => {
+                    self.probe_upstream_exhausted = true;
+                    if self.probe_buffer.is_some() {
+                        // Multi-partition: switch into replay mode
+                        // for partition 0's tail. Reset cursor — it
+                        // already advanced past every buffered
+                        // batch since we appended as we went; but
+                        // for partition 0 we've already processed
+                        // them inline, so jump to ExhaustedProbeSide.
+                        self.state = HashJoinStreamState::ExhaustedProbeSide;
+                        return Poll::Ready(Ok(StatefulStreamResult::Continue));
+                    }
+                    self.state = HashJoinStreamState::ExhaustedProbeSide;
+                    return Poll::Ready(Ok(StatefulStreamResult::Continue));
                 }
-
-                self.join_metrics.input_batches.add(1);
-                self.join_metrics.input_rows.add(batch.num_rows());
-
-                self.state =
-                    HashJoinStreamState::ProcessProbeBatch(ProcessProbeBatchState {
-                        batch,
-                        values: keys_values,
-                        offset: (0, None),
-                        joined_probe_idx: None,
-                    });
+                Some(Err(err)) => return Poll::Ready(Err(err)),
+                Some(Ok(b)) => {
+                    if let Some(buf) = self.probe_buffer.as_mut() {
+                        buf.push(b.clone());
+                    }
+                    Some(b)
+                }
             }
-            Some(Err(err)) => return Poll::Ready(Err(err)),
         };
+        let batch = match raw_batch {
+            Some(b) => b,
+            None => unreachable!("handled above"),
+        };
+
+        // Multi-partition mode: hash-route this probe batch and
+        // keep only the rows mapping to `current_partition`. Build
+        // and probe must use the same `partition_random_state`
+        // (carried on `JoinLeftData`).
+        let build_side = self.build_side.try_as_ready()?;
+        let num_partitions = build_side.left_data.num_partitions();
+        let routed_batch = if num_partitions == 1 {
+            batch
+        } else {
+            let parts = partition_batch_by_hash(
+                &batch,
+                &self.on_right,
+                num_partitions,
+                &build_side.left_data.partition_random_state,
+            )?;
+            match parts.into_iter().nth(build_side.current_partition).flatten() {
+                Some(b) => b,
+                None => {
+                    // No probe rows route to this partition — skip
+                    // and fetch the next batch.
+                    self.state = HashJoinStreamState::FetchProbeBatch;
+                    return Poll::Ready(Ok(StatefulStreamResult::Continue));
+                }
+            }
+        };
+
+        // Evaluate keys and (when the build map is a HashMap) hashes
+        // on the routed batch.
+        let keys_values =
+            evaluate_expressions_to_arrays(&self.on_right, &routed_batch)?;
+        let build_side = self.build_side.try_as_ready()?;
+        if let Map::HashMap(_) =
+            build_side.left_data.map(build_side.current_partition)
+        {
+            self.hashes_buffer.clear();
+            self.hashes_buffer.resize(routed_batch.num_rows(), 0);
+            create_hashes(
+                &keys_values,
+                &self.random_state,
+                &mut self.hashes_buffer,
+            )?;
+        }
+
+        self.join_metrics.input_batches.add(1);
+        self.join_metrics.input_rows.add(routed_batch.num_rows());
+
+        self.state = HashJoinStreamState::ProcessProbeBatch(ProcessProbeBatchState {
+            batch: routed_batch,
+            values: keys_values,
+            offset: (0, None),
+            joined_probe_idx: None,
+        });
 
         Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
@@ -982,12 +1103,35 @@ impl HashJoinStream {
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         let timer = self.join_metrics.join_time.timer();
 
+        // Multi-partition probe replay: when we've finished probing
+        // partition `p` but `p < num_partitions - 1`, advance to
+        // `p + 1`, rewind the probe-buffer cursor, and re-enter
+        // `SelectBuildPartition`. The unmatched-build emission only
+        // fires after we've drained every build partition.
+        let build_side_ready = self.build_side.try_as_ready_mut()?;
+        let num_partitions = build_side_ready.left_data.num_partitions();
+        if num_partitions > 1 && build_side_ready.current_partition + 1 < num_partitions
+        {
+            build_side_ready.current_partition += 1;
+            self.probe_buffer_replay_idx = 0;
+            // Probe-buffer is fully populated only after the upstream
+            // is exhausted; mark it now so the next pass replays
+            // straight from the buffer.
+            self.probe_upstream_exhausted = true;
+            timer.done();
+            self.state = HashJoinStreamState::SelectBuildPartition;
+            return Ok(StatefulStreamResult::Continue);
+        }
+
         if !need_produce_result_in_final(self.join_type) {
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
         }
 
         let build_side = self.build_side.try_as_ready()?;
+        // Single-partition path: per-partition emission against
+        // partition 0 (= current_partition). Multi-partition path:
+        // iterate every partition's bitmap below.
         let partition_idx = build_side.current_partition;
 
         // For null-aware anti join, if probe side had NULL, no rows should be output
@@ -1003,6 +1147,21 @@ impl HashJoinStream {
             return Ok(StatefulStreamResult::Continue);
         }
         if !build_side.left_data.report_probe_completed() {
+            self.state = HashJoinStreamState::Completed;
+            return Ok(StatefulStreamResult::Continue);
+        }
+
+        // Multi-partition: emit unmatched-build rows partition by
+        // partition. Each partition's bitmap covers only that
+        // partition's rows, and `build_batch_from_indices` indexes
+        // into that partition's `batch`, so we must batch up
+        // emissions per-partition and concatenate at the output
+        // buffer.
+        if num_partitions > 1 {
+            timer.done();
+            for p in 0..num_partitions {
+                self.emit_unmatched_for_partition(p)?;
+            }
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
         }
@@ -1078,6 +1237,66 @@ impl HashJoinStream {
         }
 
         Ok(StatefulStreamResult::Continue)
+    }
+
+    /// Emit unmatched-build rows for one partition into the output
+    /// buffer. Multi-partition mode only. Replicates the
+    /// single-partition tail of [`Self::process_unmatched_build_batch`]
+    /// against partition `p`'s bitmap and batch.
+    fn emit_unmatched_for_partition(&mut self, p: usize) -> Result<()> {
+        let build_side = self.build_side.try_as_ready()?;
+        let (mut left_side, mut right_side) = get_final_indices_from_shared_bitmap(
+            build_side.left_data.visited_indices_bitmap(p),
+            self.join_type,
+            true,
+        );
+
+        if self.null_aware
+            && self.join_type == JoinType::LeftAnti
+            && build_side
+                .left_data
+                .probe_side_non_empty
+                .load(Ordering::Relaxed)
+        {
+            let build_key_column = &build_side.left_data.values(p)[0];
+            let filtered_indices: Vec<u64> = left_side
+                .iter()
+                .filter_map(|idx| {
+                    let idx_usize = idx.unwrap() as usize;
+                    if build_key_column.is_null(idx_usize) {
+                        None
+                    } else {
+                        Some(idx.unwrap())
+                    }
+                })
+                .collect();
+            left_side = UInt64Array::from(filtered_indices);
+            let mut builder = arrow::array::UInt32Builder::with_capacity(left_side.len());
+            builder.append_nulls(left_side.len());
+            right_side = builder.finish();
+        }
+
+        self.join_metrics.input_batches.add(1);
+        self.join_metrics.input_rows.add(left_side.len());
+
+        if !left_side.is_empty() {
+            let empty_right_batch = RecordBatch::new_empty(self.right.schema());
+            let batch = build_batch_from_indices(
+                &self.schema,
+                build_side.left_data.batch(p),
+                &empty_right_batch,
+                &left_side,
+                &right_side,
+                &self.column_indices,
+                JoinSide::Left,
+                self.join_type,
+            )?;
+            let push_status = self.output_buffer.push_batch(batch)?;
+            if push_status == PushBatchStatus::LimitReached {
+                self.output_buffer.finish()?;
+            }
+        }
+        Ok(())
     }
 }
 
