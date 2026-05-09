@@ -76,6 +76,16 @@ pub(super) struct BuildSideInitialState {
 pub(super) struct BuildSideReadyState {
     /// Collected build-side data
     left_data: Arc<JoinLeftData>,
+    /// Index of the build partition currently being probed.
+    ///
+    /// PR4-C scaffolding: today the build side has exactly one
+    /// partition (see `JoinLeftData::num_partitions`) so this is
+    /// always `0`. PR4-D advances this after each
+    /// [`HashJoinStreamState::ExhaustedProbeSide`] and replays
+    /// the probe stream against the next partition; for now the
+    /// field exists so the partition-aware state machine reads
+    /// the same way at one or many partitions.
+    current_partition: usize,
 }
 
 impl BuildSide {
@@ -116,17 +126,37 @@ impl BuildSide {
 ///       WaitBuildSide
 ///             │
 ///             ▼
-///  ┌─► FetchProbeBatch ───► ExhaustedProbeSide ───► Completed
+///   (WaitPartitionBoundsReport, optional)
+///             │
+///             ▼
+///  ┌─► SelectBuildPartition ──► Completed
 ///  │          │
 ///  │          ▼
-///  └─ ProcessProbeBatch
+///  │   FetchProbeBatch ──► ExhaustedProbeSide ─┐
+///  │          │                                │
+///  │          ▼                                │
+///  │   ProcessProbeBatch                       │
+///  │          │                                │
+///  │          └────────────────────────────────┤
+///  └─────────────────────────────────────── (next partition)
 /// ```
+///
+/// At `num_partitions == 1` (today's only path) the
+/// `SelectBuildPartition` step picks partition 0 once and never
+/// loops; PR4-D will advance the partition index after
+/// [`HashJoinStreamState::ExhaustedProbeSide`] to drive grace-hash-style
+/// per-partition probe replay.
 #[derive(Debug, Clone)]
 pub(super) enum HashJoinStreamState {
     /// Initial state for HashJoinStream indicating that build-side data not collected yet
     WaitBuildSide,
     /// Waiting for bounds to be reported by all partitions
     WaitPartitionBoundsReport,
+    /// Build side is ready; pick the next build partition to
+    /// probe (or transition to [`Self::Completed`] when all
+    /// partitions are exhausted). At `num_partitions == 1` this
+    /// is entered exactly once.
+    SelectBuildPartition,
     /// Indicates that build-side has been collected, and stream is ready for fetching probe-side
     FetchProbeBatch,
     /// Indicates that non-empty batch has been fetched from probe-side, and is ready to be processed
@@ -424,17 +454,13 @@ impl HashJoinStream {
 
     /// Returns the next state after the build side has been fully collected
     /// and any required build-side coordination has completed.
-    fn state_after_build_ready(
-        join_type: JoinType,
-        left_data: &JoinLeftData,
-    ) -> HashJoinStreamState {
-        if left_data.map().is_empty()
-            && join_type.empty_build_side_produces_empty_result()
-        {
-            HashJoinStreamState::Completed
-        } else {
-            HashJoinStreamState::FetchProbeBatch
-        }
+    ///
+    /// Always transitions into [`HashJoinStreamState::SelectBuildPartition`];
+    /// the per-partition emptiness check (and the special case where
+    /// every partition is empty for a join type whose result is fixed
+    /// to empty) is centralized in [`Self::select_build_partition`].
+    fn state_after_build_ready(_left_data: &JoinLeftData) -> HashJoinStreamState {
+        HashJoinStreamState::SelectBuildPartition
     }
 
     /// Transitions state after build-side data has been collected, automatically
@@ -449,7 +475,7 @@ impl HashJoinStream {
         left_data: &Arc<JoinLeftData>,
     ) -> HashJoinStreamState {
         let Some(build_accumulator) = self.build_accumulator.as_ref() else {
-            return Self::state_after_build_ready(self.join_type, left_data.as_ref());
+            return Self::state_after_build_ready(left_data.as_ref());
         };
 
         let pushdown = left_data.membership().clone();
@@ -507,6 +533,9 @@ impl HashJoinStream {
                 HashJoinStreamState::WaitPartitionBoundsReport => {
                     handle_state!(ready!(self.wait_for_partition_bounds_report(cx)))
                 }
+                HashJoinStreamState::SelectBuildPartition => {
+                    handle_state!(self.select_build_partition())
+                }
                 HashJoinStreamState::FetchProbeBatch => {
                     handle_state!(ready!(self.fetch_probe_batch(cx)))
                 }
@@ -546,8 +575,57 @@ impl HashJoinStream {
         }
         let build_side = self.build_side.try_as_ready()?;
         self.state =
-            Self::state_after_build_ready(self.join_type, build_side.left_data.as_ref());
+            Self::state_after_build_ready(build_side.left_data.as_ref());
         Poll::Ready(Ok(StatefulStreamResult::Continue))
+    }
+
+    /// Pick the next build partition to probe.
+    ///
+    /// PR4-C scaffolding: at `num_partitions == 1` (today's only
+    /// path) this is entered exactly once with `current_partition
+    /// == 0`. The handler:
+    ///
+    /// * If `current_partition >= num_partitions`, every build
+    ///   partition has been probed → transition to
+    ///   [`HashJoinStreamState::Completed`].
+    /// * Otherwise, if the active partition's hash map is empty
+    ///   *and* the join type's output collapses to empty when the
+    ///   build side is empty, also transition to `Completed` —
+    ///   this preserves the early-skip behavior the previous
+    ///   single-hashmap path handled in `state_after_build_ready`.
+    /// * Otherwise, transition to
+    ///   [`HashJoinStreamState::FetchProbeBatch`] to start (or
+    ///   replay, in PR4-D) the probe stream against this
+    ///   partition.
+    ///
+    /// PR4-D will introduce a `MaterializePartition` step here
+    /// for `OnDisk` partition entries; until then every partition
+    /// is `Resident` and the handler is purely synchronous.
+    fn select_build_partition(
+        &mut self,
+    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        let build_side = self.build_side.try_as_ready()?;
+        let num_partitions = build_side.left_data.num_partitions();
+        debug_assert!(
+            num_partitions == 1,
+            "PR4-C: only num_partitions == 1 is wired today; PR4-D adds the multi-partition probe loop"
+        );
+        if build_side.current_partition >= num_partitions {
+            self.state = HashJoinStreamState::Completed;
+            return Ok(StatefulStreamResult::Continue);
+        }
+        // PR4-C reuses the same flat-`JoinLeftData` accessors —
+        // `map()`, `batch()`, `values()`, `visited_indices_bitmap()` —
+        // which delegate to `partitions[0]`. PR4-D will switch
+        // these to take a partition index.
+        if build_side.left_data.map().is_empty()
+            && self.join_type.empty_build_side_produces_empty_result()
+        {
+            self.state = HashJoinStreamState::Completed;
+            return Ok(StatefulStreamResult::Continue);
+        }
+        self.state = HashJoinStreamState::FetchProbeBatch;
+        Ok(StatefulStreamResult::Continue)
     }
 
     /// Collects build-side data by polling `OnceFut` future from initialized build-side
@@ -573,7 +651,14 @@ impl HashJoinStream {
 
         self.state = self.transition_after_build_collected(&left_data);
 
-        self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
+        self.build_side = BuildSide::Ready(BuildSideReadyState {
+            left_data,
+            // PR4-C scaffolding: probe always starts at partition 0.
+            // The probe state machine advances `current_partition`
+            // after [`HashJoinStreamState::ExhaustedProbeSide`] when
+            // `num_partitions > 1` (PR4-D); today it stays at 0.
+            current_partition: 0,
+        });
         Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
 

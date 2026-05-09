@@ -301,6 +301,15 @@ impl JoinLeftData {
         self.probe_threads_counter.fetch_sub(1, Ordering::Relaxed) == 1
     }
 
+    /// Number of build partitions held by this `JoinLeftData`.
+    ///
+    /// PR4-B/C scaffolding: always returns 1 today. PR4-D will
+    /// return the actual partition count once the build side
+    /// stops collapsing into a single concatenated batch.
+    pub(super) fn num_partitions(&self) -> usize {
+        self.partitions.len()
+    }
+
     /// Borrow the shared `Arc<Map>` for the single build partition.
     ///
     /// Used by [`SharedBuildAccumulator`] to share the build-side
