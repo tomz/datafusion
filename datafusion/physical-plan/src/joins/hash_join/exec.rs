@@ -108,6 +108,18 @@ pub(crate) const HASH_JOIN_SEED: SeededRandomState =
 
 const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &str = "array_map_created_count";
 
+/// Counter incremented when the same build partition spills twice
+/// in a row, signalling skew. PR4-F ships this as a observability
+/// stub; full recursive sub-partitioning (different hash seed for
+/// the skewed partition) is a follow-up.
+const HASH_JOIN_SKEW_PARTITION_COUNT_METRIC_NAME: &str =
+    "hash_join_skew_partition_count";
+
+/// Threshold for marking a partition as skewed. After this many
+/// consecutive spills onto the same partition slot, the skew
+/// counter increments once.
+const HASH_JOIN_SKEW_SPILL_THRESHOLD: usize = 2;
+
 #[expect(clippy::too_many_arguments)]
 fn try_create_array_map(
     bounds: &Option<PartitionBounds>,
@@ -1565,6 +1577,16 @@ impl ExecutionPlan for HashJoinExec {
             .with_category(MetricCategory::Rows)
             .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, partition);
 
+        // PR4-F: skew detection. Counter ticks once per partition
+        // that crosses [`HASH_JOIN_SKEW_SPILL_THRESHOLD`]
+        // consecutive spills onto the same slot — a signal that
+        // the hash router is concentrating rows in a single
+        // partition and full recursive sub-partitioning is
+        // needed (follow-up PR).
+        let skew_partition_count = MetricBuilder::new(&self.metrics)
+            .with_category(MetricCategory::Rows)
+            .counter(HASH_JOIN_SKEW_PARTITION_COUNT_METRIC_NAME, partition);
+
         // Initialize build_accumulator lazily with runtime partition counts (only if enabled)
         // Use RepartitionExec's random state (seeds: 0,0,0,0) for partition routing
         let repartition_random_state = REPARTITION_RANDOM_STATE;
@@ -1627,6 +1649,7 @@ impl ExecutionPlan for HashJoinExec {
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
+                    skew_partition_count.clone(),
                     Arc::clone(&runtime_env),
                     metrics_set.clone(),
                     0,
@@ -1651,6 +1674,7 @@ impl ExecutionPlan for HashJoinExec {
                     Arc::clone(context.session_config().options()),
                     self.null_equality,
                     array_map_created_count,
+                    skew_partition_count.clone(),
                     Arc::clone(&runtime_env),
                     metrics_set.clone(),
                     partition,
@@ -2187,6 +2211,21 @@ struct BuildSideState {
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
     bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
+    /// Per-partition consecutive-spill counter. Reset to 0 for
+    /// every partition that is *not* the spill victim each round,
+    /// incremented for the victim. PR4-F's skew detector ticks
+    /// `skew_partition_count` once when any entry crosses
+    /// [`HASH_JOIN_SKEW_SPILL_THRESHOLD`] (rising-edge only, so we
+    /// don't double-count the same skew).
+    consecutive_spills: Vec<usize>,
+    /// PR4-F skew metric counter. Bumped exactly once per
+    /// partition slot that gets flagged as skewed by the
+    /// consecutive-spill heuristic.
+    skew_partition_count: Count,
+    /// Set of partition indices we've already flagged as skewed,
+    /// so the metric counter rises monotonically rather than
+    /// ticking on every spill after the threshold.
+    skew_flagged: Vec<bool>,
 }
 
 impl BuildSideState {
@@ -2205,6 +2244,7 @@ impl BuildSideState {
         num_partitions: usize,
         partition_random_state: RandomState,
         spill_manager: Option<Arc<SpillManager>>,
+        skew_partition_count: Count,
     ) -> Result<Self> {
         assert!(num_partitions > 0, "num_partitions must be > 0");
         // Spill manager is only meaningful in multi-partition mode.
@@ -2230,6 +2270,9 @@ impl BuildSideState {
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
+            consecutive_spills: vec![0; num_partitions],
+            skew_partition_count,
+            skew_flagged: vec![false; num_partitions],
         })
     }
 
@@ -2327,6 +2370,27 @@ impl BuildSideState {
                     num_rows,
                     bytes,
                 };
+                // PR4-F skew detector. Bump the victim's
+                // consecutive-spill counter and reset every other
+                // partition's counter, so the count tracks runs
+                // of "the same partition kept being the largest."
+                // When a victim crosses the threshold (and we
+                // haven't already flagged it), tick the metric.
+                if victim_idx < self.consecutive_spills.len() {
+                    self.consecutive_spills[victim_idx] += 1;
+                    for (idx, c) in self.consecutive_spills.iter_mut().enumerate() {
+                        if idx != victim_idx {
+                            *c = 0;
+                        }
+                    }
+                    if self.consecutive_spills[victim_idx]
+                        >= HASH_JOIN_SKEW_SPILL_THRESHOLD
+                        && !self.skew_flagged[victim_idx]
+                    {
+                        self.skew_flagged[victim_idx] = true;
+                        self.skew_partition_count.add(1);
+                    }
+                }
                 Ok(true)
             }
             // No-op spill (empty input). Slot is already a default
@@ -2373,6 +2437,12 @@ impl BuildSideState {
                 // readback walks the entire vector and folds both
                 // back into the flat batch list.
                 self.partitions.push(old_spilled);
+                // PR4-F: keep the skew bookkeeping vectors aligned
+                // with `partitions` so `spill_largest_in_memory_partition`
+                // can index by `victim_idx` regardless of these
+                // synthetic appends.
+                self.consecutive_spills.push(0);
+                self.skew_flagged.push(false);
             } else {
                 self.partitions[idx].push(b)?;
             }
@@ -2407,6 +2477,9 @@ impl BuildSideState {
             metrics,
             reservation,
             bounds_accumulators,
+            consecutive_spills: _,
+            skew_partition_count: _,
+            skew_flagged: _,
         } = self;
         let mut out: Vec<PartitionFinalState> = Vec::with_capacity(partitions.len());
         let mut total_rows = 0usize;
@@ -2617,6 +2690,7 @@ async fn collect_left_input(
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     array_map_created_count: Count,
+    skew_partition_count: Count,
     runtime_env: Arc<RuntimeEnv>,
     metrics_set: ExecutionPlanMetricsSet,
     partition_idx: usize,
@@ -2673,6 +2747,7 @@ async fn collect_left_input(
         num_build_partitions,
         partition_random_state,
         spill_manager,
+        skew_partition_count,
     )?;
 
     let state = left_stream
@@ -3846,6 +3921,88 @@ mod tests {
         Ok(())
     }
 
+    /// PR4-F: skew counter ticks once when one partition slot
+    /// keeps absorbing every spill.
+    ///
+    /// Drives `BuildSideState` directly with a constant-key
+    /// build set so every batch hashes to the same partition.
+    /// Successive `spill_largest_in_memory_partition` calls
+    /// will pick that one slot every time; the consecutive-spill
+    /// counter crosses [`HASH_JOIN_SKEW_SPILL_THRESHOLD`] on the
+    /// second run and the skew metric increments exactly once
+    /// (not on every subsequent spill).
+    #[tokio::test]
+    async fn pr4_skew_counter_rises_once() -> Result<()> {
+        use crate::metrics::SpillMetrics;
+        use datafusion_execution::memory_pool::MemoryConsumer;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let on_left: Vec<Arc<dyn PhysicalExpr>> =
+            vec![Arc::new(Column::new_with_schema("b", &schema)?)];
+
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let join_metrics = BuildProbeJoinMetrics::new(0, &metrics_set);
+        let reservation =
+            MemoryConsumer::new("HashJoinSkewTest").register(&runtime.memory_pool);
+        let spill_metrics = SpillMetrics::new(&metrics_set, 0);
+        let spill_manager = Arc::new(SpillManager::new(
+            Arc::clone(&runtime),
+            spill_metrics,
+            Arc::clone(&schema),
+        ));
+        let skew_count = MetricBuilder::new(&metrics_set)
+            .with_category(MetricCategory::Rows)
+            .counter(HASH_JOIN_SKEW_PARTITION_COUNT_METRIC_NAME, 0);
+
+        let mut state = BuildSideState::try_new(
+            join_metrics,
+            reservation,
+            on_left.clone(),
+            &schema,
+            false,
+            4,
+            RandomState::with_seed(0),
+            Some(Arc::clone(&spill_manager)),
+            skew_count,
+        )?;
+
+        // All rows share key=42 → every batch routes to a single
+        // partition slot (whichever `42 % 4` lands on under the
+        // partition_random_state hash). After each push we
+        // immediately spill, so the same slot is the largest
+        // each round; PR3's push-into-spilled promotion appends
+        // a fresh InMemory shadow alongside the previous Spilled
+        // marker, and the next spill picks that shadow as victim
+        // — driving the consecutive-spill counter on the *same*
+        // logical hot key.
+        for _ in 0..4 {
+            let keys: Vec<i32> = vec![42; 50];
+            let payload: Vec<i32> = vec![0; 50];
+            let extra: Vec<i32> = vec![0; 50];
+            let batch = build_table_i32(("a", &payload), ("b", &keys), ("c", &extra));
+            let bytes = get_record_batch_memory_size(&batch);
+            state.reservation.try_grow(bytes)?;
+            state.push_batch(batch)?;
+            assert!(state.spill_largest_in_memory_partition()?);
+        }
+
+        let skew = metrics_set
+            .clone_inner()
+            .sum_by_name(HASH_JOIN_SKEW_PARTITION_COUNT_METRIC_NAME)
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(
+            skew, 1,
+            "expected exactly one skew-partition flag, got {skew}"
+        );
+        Ok(())
+    }
+
     /// PR4-E: outer-join correctness under multi-partition build.
     ///
     /// PR4-D-3a moved `visited_indices_bitmap` onto each
@@ -3959,6 +4116,9 @@ mod tests {
             Arc::clone(&schema),
         ));
 
+        let skew_count = MetricBuilder::new(&metrics_set)
+            .with_category(MetricCategory::Rows)
+            .counter(HASH_JOIN_SKEW_PARTITION_COUNT_METRIC_NAME, 0);
         let mut state = BuildSideState::try_new(
             join_metrics,
             reservation,
@@ -3968,6 +4128,7 @@ mod tests {
             4,     // num_partitions
             RandomState::with_seed(0),
             Some(Arc::clone(&spill_manager)),
+            skew_count,
         )?;
 
         // Push 12 batches of 50 rows each (600 rows total).
