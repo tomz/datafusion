@@ -54,15 +54,19 @@
 //! probe-side already partitioned by the same key) can skip
 //! the hash step via [`partition_with_hashes`].
 
+// Items are foundation for upcoming PRs in the external hash
+// join series; not yet wired into the build path.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
-use datafusion_common::hash_utils::RandomState;
 use arrow::array::ArrayRef;
+use arrow::array::PrimitiveArray;
 use arrow::compute::take_record_batch;
 use arrow::datatypes::UInt64Type;
-use arrow::array::PrimitiveArray;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
+use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
@@ -108,20 +112,22 @@ pub fn partition_with_hashes(
     hashes: &[u64],
     num_partitions: usize,
 ) -> Result<Vec<Option<RecordBatch>>> {
-    assert_eq!(hashes.len(), batch.num_rows(),
-        "hashes.len() must match batch.num_rows()");
+    assert_eq!(
+        hashes.len(),
+        batch.num_rows(),
+        "hashes.len() must match batch.num_rows()"
+    );
     assert!(num_partitions > 0);
 
     // Bucket row indices by partition.
-    let mut buckets: Vec<Vec<u64>> = (0..num_partitions)
-        .map(|_| Vec::new())
-        .collect();
+    let mut buckets: Vec<Vec<u64>> = (0..num_partitions).map(|_| Vec::new()).collect();
     let n = num_partitions as u64;
     for (row_idx, &h) in hashes.iter().enumerate() {
         buckets[(h % n) as usize].push(row_idx as u64);
     }
     // Slice the batch by each bucket.
-    buckets.into_iter()
+    buckets
+        .into_iter()
         .map(|indices| {
             if indices.is_empty() {
                 Ok(None)
@@ -140,13 +146,12 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
     use datafusion_physical_expr::expressions::Column;
+    use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
     fn batch_int64(name: &str, values: Vec<i64>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(name, DataType::Int64, false),
-        ]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
         let arr: ArrayRef = Arc::new(Int64Array::from(values));
         RecordBatch::try_new(schema, vec![arr]).unwrap()
     }
@@ -157,9 +162,11 @@ mod tests {
             Field::new("v", DataType::Utf8, false),
         ]));
         let ks: ArrayRef = Arc::new(Int64Array::from(
-            rows.iter().map(|(k, _)| *k).collect::<Vec<_>>()));
+            rows.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        ));
         let vs: ArrayRef = Arc::new(StringArray::from(
-            rows.iter().map(|(_, v)| *v).collect::<Vec<_>>()));
+            rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        ));
         RecordBatch::try_new(schema, vec![ks, vs]).unwrap()
     }
 
@@ -175,14 +182,17 @@ mod tests {
         let batch = batch_int64("k", (0..1000).collect());
         let rs = RandomState::with_seed(0);
         let parts = partition_batch_by_hash(&batch, &[col("k", 0)], 8, &rs).unwrap();
-        let counts: Vec<usize> = parts.iter()
+        let counts: Vec<usize> = parts
+            .iter()
             .map(|p| p.as_ref().map(|b| b.num_rows()).unwrap_or(0))
             .collect();
         let total: usize = counts.iter().sum();
         assert_eq!(total, 1000, "all rows accounted for");
         for c in &counts {
-            assert!(*c >= 50 && *c <= 250,
-                "partition count {c} out of expected range; counts={counts:?}");
+            assert!(
+                *c >= 50 && *c <= 250,
+                "partition count {c} out of expected range; counts={counts:?}"
+            );
         }
     }
 
@@ -212,14 +222,20 @@ mod tests {
         // (Int64, Utf8) compound key — verify partitioning works
         // across multiple key columns and produces coverage.
         let batch = batch_int64_str(vec![
-            (1, "a"), (1, "b"), (2, "a"), (2, "b"),
-            (3, "a"), (3, "b"), (4, "a"), (4, "b"),
+            (1, "a"),
+            (1, "b"),
+            (2, "a"),
+            (2, "b"),
+            (3, "a"),
+            (3, "b"),
+            (4, "a"),
+            (4, "b"),
         ]);
         let rs = RandomState::with_seed(0);
-        let parts = partition_batch_by_hash(
-            &batch, &[col("k", 0), col("v", 1)], 4, &rs,
-        ).unwrap();
-        let total: usize = parts.iter()
+        let parts =
+            partition_batch_by_hash(&batch, &[col("k", 0), col("v", 1)], 4, &rs).unwrap();
+        let total: usize = parts
+            .iter()
             .map(|p| p.as_ref().map(|b| b.num_rows()).unwrap_or(0))
             .sum();
         assert_eq!(total, 8, "all 8 rows accounted for");
@@ -236,7 +252,7 @@ mod tests {
         let p2 = partition_batch_by_hash(&batch, &[col("k", 0)], 8, &rs).unwrap();
         for (a, b) in p1.iter().zip(p2.iter()) {
             match (a, b) {
-                (None, None) => {},
+                (None, None) => {}
                 (Some(a), Some(b)) => assert_eq!(a.num_rows(), b.num_rows()),
                 _ => panic!("non-deterministic partitioning"),
             }
