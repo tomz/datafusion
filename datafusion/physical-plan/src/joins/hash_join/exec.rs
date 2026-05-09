@@ -2227,7 +2227,7 @@ impl BuildSideState {
             partition_random_state: _,
             spill_manager,
             metrics,
-            mut reservation,
+            reservation,
             bounds_accumulators,
         } = self;
         let mut out: Vec<PartitionFinalState> = Vec::with_capacity(partitions.len());
@@ -2247,22 +2247,25 @@ impl BuildSideState {
                     bytes,
                 } => {
                     total_rows += num_rows;
-                    // Restore the reservation for the in-memory
-                    // copy we are about to materialize.
-                    reservation.try_grow(bytes)?;
-                    metrics.build_mem_used.add(bytes);
-                    let sm = spill_manager.as_ref().ok_or_else(|| {
+                    // PR4-D-2: defer readback. We do NOT regrow
+                    // the reservation here — that happens in
+                    // `MaterializePartition` (or on demand in
+                    // `into_flat_batches` for the single-hashmap
+                    // path). Reservation accounting still nets
+                    // out: the bytes were `shrink`-ed during
+                    // spill, and will be `try_grow`-ed when the
+                    // slot is materialized.
+                    let sm = spill_manager.as_ref().cloned().ok_or_else(|| {
                         DataFusionError::Internal(
                             "BUG: spilled partition without spill_manager".into(),
                         )
                     })?;
-                    let mut stream = sm.read_spill_as_stream(file, None)?;
-                    use futures::StreamExt;
-                    let mut batches = Vec::new();
-                    while let Some(batch) = stream.next().await {
-                        batches.push(batch?);
-                    }
-                    out.push(PartitionFinalState::Resident { batches, num_rows });
+                    out.push(PartitionFinalState::Spilled {
+                        file,
+                        num_rows,
+                        bytes,
+                        spill_manager: sm,
+                    });
                 }
             }
         }
@@ -2284,12 +2287,38 @@ impl BuildSideState {
     /// to keep the existing single-hashmap probe path bit-for-bit
     /// equivalent while the per-partition machinery is wired up
     /// behind the scenes.
-    async fn into_flat_batches(self) -> Result<(Vec<RecordBatch>, FinalizedBuildSide)> {
-        let (partitions, finalized) = self.into_partition_finalize().await?;
+    ///
+    /// PR4-D-2 moves spill readback out of `into_partition_finalize`
+    /// (which now emits the `Spilled` variant directly), so this
+    /// function performs the readback locally — it remains the
+    /// "collapse to one concatenated batch" entry point that the
+    /// existing single-hashmap probe consumes.
+    async fn into_flat_batches(
+        self,
+    ) -> Result<(Vec<RecordBatch>, FinalizedBuildSide)> {
+        let (partitions, mut finalized) = self.into_partition_finalize().await?;
         let mut flat: Vec<RecordBatch> = Vec::new();
         for p in partitions {
             match p {
                 PartitionFinalState::Resident { batches, .. } => flat.extend(batches),
+                PartitionFinalState::Spilled {
+                    file,
+                    bytes,
+                    spill_manager,
+                    ..
+                } => {
+                    // Restore the reservation for the in-memory
+                    // copy we are about to materialize. Mirrors
+                    // PR4-A's pre-split behavior so accounting is
+                    // identical end-to-end.
+                    finalized.reservation.try_grow(bytes)?;
+                    finalized.metrics.build_mem_used.add(bytes);
+                    let mut stream = spill_manager.read_spill_as_stream(file, None)?;
+                    use futures::StreamExt;
+                    while let Some(batch) = stream.next().await {
+                        flat.push(batch?);
+                    }
+                }
             }
         }
         Ok((flat, finalized))
@@ -2299,12 +2328,14 @@ impl BuildSideState {
 /// Finalized per-partition build state, returned from
 /// [`BuildSideState::into_partition_finalize`].
 ///
-/// PR4-A only emits the `Resident` variant — spilled partitions are
-/// read back into memory at finalize time, preserving PR3's
-/// "build > pool requires probe-time replay" limitation. The enum
-/// shape is in place so PR4-D can introduce a `Spilled` variant
-/// that defers readback until probe time, without further churn at
-/// the call site.
+/// PR4-D-2 introduces the `Spilled` variant. The single-hashmap
+/// probe path (consumed via [`BuildSideState::into_flat_batches`])
+/// reads spilled slots back into RAM at flatten time, so PR3's
+/// "build collapses to one concatenated batch" behavior is
+/// preserved bit-for-bit. PR4-D-3 will route `Spilled` straight
+/// into [`super::stream::HashJoinStream`]'s `MaterializePartition`
+/// state so probe-time replay no longer round-trips through the
+/// build-time memory pool.
 #[derive(Debug)]
 enum PartitionFinalState {
     /// Build batches resident in memory, ready to feed the
@@ -2318,6 +2349,30 @@ enum PartitionFinalState {
         // PR4-A so the scaffolding lands without churn.
         #[allow(dead_code)]
         num_rows: usize,
+    },
+    /// Build batches still on disk. The reservation has *not*
+    /// been regrown; whoever materializes this slot is responsible
+    /// for `reservation.try_grow(bytes)` before reading the spill
+    /// file back.
+    ///
+    /// `spill_manager` is held here (rather than on the parent
+    /// `JoinLeftData`) so each slot is self-contained: the
+    /// per-partition probe path in PR4-D-3 can `mem::replace` an
+    /// individual slot to `Resident` without holding a borrow on
+    /// the rest of the build state.
+    Spilled {
+        file: RefCountedTempFile,
+        // PR4-D-3 will read `num_rows` to pre-size the
+        // visited-indices bitmap when materializing this slot.
+        #[allow(dead_code)]
+        num_rows: usize,
+        // PR4-D-3 will read `bytes` to `try_grow` the reservation
+        // before readback; allowed dead in PR4-D-2 because
+        // `into_flat_batches` is the only caller and it already
+        // has `bytes` from the destructuring pattern.
+        #[allow(dead_code)]
+        bytes: usize,
+        spill_manager: Arc<SpillManager>,
     },
 }
 
