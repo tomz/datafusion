@@ -132,6 +132,9 @@ impl BuildSide {
 ///  ┌─► SelectBuildPartition ──► Completed
 ///  │          │
 ///  │          ▼
+///  │   MaterializePartition
+///  │          │
+///  │          ▼
 ///  │   FetchProbeBatch ──► ExhaustedProbeSide ─┐
 ///  │          │                                │
 ///  │          ▼                                │
@@ -145,7 +148,9 @@ impl BuildSide {
 /// `SelectBuildPartition` step picks partition 0 once and never
 /// loops; PR4-D will advance the partition index after
 /// [`HashJoinStreamState::ExhaustedProbeSide`] to drive grace-hash-style
-/// per-partition probe replay.
+/// per-partition probe replay. `MaterializePartition` is a no-op
+/// for resident partitions and reserves space for the async
+/// spill-readback path that PR4-D-2 introduces.
 #[derive(Debug, Clone)]
 pub(super) enum HashJoinStreamState {
     /// Initial state for HashJoinStream indicating that build-side data not collected yet
@@ -157,6 +162,13 @@ pub(super) enum HashJoinStreamState {
     /// partitions are exhausted). At `num_partitions == 1` this
     /// is entered exactly once.
     SelectBuildPartition,
+    /// Ensure the active build partition's hash map and batch
+    /// are resident in memory. PR4-D-1 scaffolding: no-op for
+    /// resident partitions (the only kind today). PR4-D-2 will
+    /// turn this into an async spill-readback that grows the
+    /// memory reservation, streams batches back from the spill
+    /// file, and rebuilds the partition's hash map.
+    MaterializePartition,
     /// Indicates that build-side has been collected, and stream is ready for fetching probe-side
     FetchProbeBatch,
     /// Indicates that non-empty batch has been fetched from probe-side, and is ready to be processed
@@ -536,6 +548,9 @@ impl HashJoinStream {
                 HashJoinStreamState::SelectBuildPartition => {
                     handle_state!(self.select_build_partition())
                 }
+                HashJoinStreamState::MaterializePartition => {
+                    handle_state!(ready!(self.materialize_partition(cx)))
+                }
                 HashJoinStreamState::FetchProbeBatch => {
                     handle_state!(ready!(self.fetch_probe_batch(cx)))
                 }
@@ -624,8 +639,34 @@ impl HashJoinStream {
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
         }
-        self.state = HashJoinStreamState::FetchProbeBatch;
+        self.state = HashJoinStreamState::MaterializePartition;
         Ok(StatefulStreamResult::Continue)
+    }
+
+    /// Ensure the active build partition is resident in memory
+    /// before the probe path consumes it.
+    ///
+    /// PR4-D-1 scaffolding: every partition is `Resident` today,
+    /// so this is a synchronous no-op that just transitions to
+    /// [`HashJoinStreamState::FetchProbeBatch`]. The signature
+    /// is `Poll<...>` so PR4-D-2 can plug in async spill readback
+    /// without touching `poll_next_impl`. Returning
+    /// `Poll::Ready(Continue)` keeps the loop tight at default
+    /// config.
+    fn materialize_partition(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        let build_side = self.build_side.try_as_ready()?;
+        debug_assert!(
+            build_side.left_data.num_partitions() == 1,
+            "PR4-D-1: only num_partitions == 1 is wired today; PR4-D-2 adds spill readback"
+        );
+        // Resident partition — nothing to materialize. Hash map,
+        // batch, and bitmap are already in RAM via PR4-B's
+        // `JoinLeftPartitionData`.
+        self.state = HashJoinStreamState::FetchProbeBatch;
+        Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
 
     /// Collects build-side data by polling `OnceFut` future from initialized build-side

@@ -221,6 +221,7 @@ pub(super) struct JoinLeftPartitionData {
     /// PR4-B keeps a single partition so this is equal to the
     /// parent [`JoinLeftData::bounds`]; PR4-C will fan out and
     /// the parent will hold the union.
+    #[allow(dead_code)]
     pub(super) bounds: Option<PartitionBounds>,
 }
 
