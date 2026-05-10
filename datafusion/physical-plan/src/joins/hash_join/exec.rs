@@ -54,9 +54,6 @@ use crate::projection::{
 use crate::repartition::REPARTITION_RANDOM_STATE;
 use crate::spill::SpillManager;
 use crate::spill::get_record_batch_memory_size;
-use datafusion_common::config::SpillCompression;
-use datafusion_execution::disk_manager::RefCountedTempFile;
-use datafusion_execution::runtime_env::RuntimeEnv;
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     PlanProperties, SendableRecordBatchStream, Statistics,
@@ -68,6 +65,9 @@ use crate::{
     },
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
+use datafusion_common::config::SpillCompression;
+use datafusion_execution::disk_manager::RefCountedTempFile;
+use datafusion_execution::runtime_env::RuntimeEnv;
 
 use arrow::array::{ArrayRef, BooleanBufferBuilder};
 use arrow::compute::concat_batches;
@@ -75,8 +75,8 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
 use arrow_schema::{DataType, Schema};
-use datafusion_common::config::ConfigOptions;
 use datafusion_common::DataFusionError;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
@@ -112,8 +112,7 @@ const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &str = "array_map_created_count";
 /// in a row, signalling skew. PR4-F ships this as a observability
 /// stub; full recursive sub-partitioning (different hash seed for
 /// the skewed partition) is a follow-up.
-const HASH_JOIN_SKEW_PARTITION_COUNT_METRIC_NAME: &str =
-    "hash_join_skew_partition_count";
+const HASH_JOIN_SKEW_PARTITION_COUNT_METRIC_NAME: &str = "hash_join_skew_partition_count";
 
 /// Threshold for marking a partition as skewed. After this many
 /// consecutive spills onto the same partition slot, the skew
@@ -231,7 +230,7 @@ pub(super) struct JoinLeftPartitionData {
     /// PR4-D-3a keeps a single partition so this is equal to the
     /// parent [`JoinLeftData::bounds`]; PR4-D-3b will fan out and
     /// the parent will hold the union.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(super) bounds: Option<PartitionBounds>,
 }
 
@@ -292,12 +291,11 @@ pub(super) struct JoinLeftData {
     /// otherwise build/probe end up in different partitions. Carried
     /// here so [`super::stream::HashJoinStream`] can hash-route
     /// probe batches identically in PR4-D-3b.
-    #[allow(dead_code)]
     pub(super) partition_random_state: RandomState,
     /// Spill manager used to read [`PartitionEntry::Spilled`] slots
     /// back from disk during probe-time materialization. `None`
     /// when build ran in single-partition mode (no spill).
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(super) spill_manager: Option<Arc<SpillManager>>,
     /// Captured at build time so [`Self::materialize_partition`] can
     /// rebuild a partition's hash map / batch / bitmap from a spill
@@ -397,7 +395,7 @@ impl JoinLeftData {
     /// Used by [`SharedBuildAccumulator`] to share the build-side
     /// hash table for filter pushdown without cloning the table
     /// data itself.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(super) fn map_arc(&self, partition_idx: usize) -> &Arc<Map> {
         &self.partition(partition_idx).map
     }
@@ -421,10 +419,7 @@ impl JoinLeftData {
     /// `tokio::sync::OnceCell::get_or_try_init` ensures the
     /// readback runs exactly once per slot regardless of how many
     /// streams race on it. `Resident` slots are a no-op fast path.
-    pub(super) async fn materialize_partition(
-        &self,
-        partition_idx: usize,
-    ) -> Result<()> {
+    pub(super) async fn materialize_partition(&self, partition_idx: usize) -> Result<()> {
         let slot = match &self.partitions[partition_idx] {
             PartitionEntry::Resident(_) => return Ok(()),
             PartitionEntry::Spilled(slot) => slot,
@@ -451,7 +446,7 @@ impl JoinLeftData {
                     batches.push(b?);
                 }
                 let partition_data = build_partition_data(
-                    batches,
+                    &batches,
                     slot.num_rows,
                     None,
                     &ctx.schema,
@@ -1562,9 +1557,8 @@ impl ExecutionPlan for HashJoinExec {
                 .hash_join_num_partitions
                 > 1;
         let enable_dynamic_filter_pushdown = !multi_partition_build
-            && self.allow_join_dynamic_filter_pushdown(
-                context.session_config().options(),
-            )
+            && self
+                .allow_join_dynamic_filter_pushdown(context.session_config().options())
             && self
                 .dynamic_filter
                 .as_ref()
@@ -2154,17 +2148,11 @@ impl BuildPartition {
 }
 
 impl PartitionSlot {
+    #[cfg(test)]
     fn num_rows(&self) -> usize {
         match self {
             PartitionSlot::InMemory(p) => p.num_rows,
             PartitionSlot::Spilled { num_rows, .. } => *num_rows,
-        }
-    }
-
-    fn in_mem_bytes(&self) -> usize {
-        match self {
-            PartitionSlot::InMemory(p) => p.bytes,
-            PartitionSlot::Spilled { .. } => 0,
         }
     }
 
@@ -2235,6 +2223,7 @@ impl BuildSideState {
     /// no spill machinery. Values >1 activate hash-routing of
     /// incoming batches and per-partition disk spill on memory
     /// pressure.
+    #[expect(clippy::too_many_arguments)]
     fn try_new(
         metrics: BuildProbeJoinMetrics,
         reservation: MemoryReservation,
@@ -2277,6 +2266,7 @@ impl BuildSideState {
     }
 
     /// Total rows accumulated across all partitions.
+    #[cfg(test)]
     fn num_rows(&self) -> usize {
         self.partitions.iter().map(|p| p.num_rows()).sum()
     }
@@ -2430,7 +2420,8 @@ impl BuildSideState {
                 // this as overwriting only after the new batch is
                 // pushed via a small helper.
                 let new_in_mem = PartitionSlot::InMemory(BuildPartition::default());
-                let old_spilled = std::mem::replace(&mut self.partitions[idx], new_in_mem);
+                let old_spilled =
+                    std::mem::replace(&mut self.partitions[idx], new_in_mem);
                 self.partitions[idx].push(b)?;
                 // Record the pre-existing spilled bytes by stashing
                 // a synthetic extra slot at the end of the vector;
@@ -2544,10 +2535,8 @@ impl BuildSideState {
     /// function performs the readback locally — it remains the
     /// "collapse to one concatenated batch" entry point that the
     /// existing single-hashmap probe consumes.
-    async fn into_flat_batches(
-        self,
-    ) -> Result<(Vec<RecordBatch>, FinalizedBuildSide)> {
-        let (partitions, mut finalized) = self.into_partition_finalize().await?;
+    async fn into_flat_batches(self) -> Result<(Vec<RecordBatch>, FinalizedBuildSide)> {
+        let (partitions, finalized) = self.into_partition_finalize().await?;
         let mut flat: Vec<RecordBatch> = Vec::new();
         for p in partitions {
             match p {
@@ -2598,7 +2587,6 @@ enum PartitionFinalState {
         // PR4-B will read `num_rows` when sizing per-partition
         // hash maps and visited-indices bitmaps. Allowed dead in
         // PR4-A so the scaffolding lands without churn.
-        #[allow(dead_code)]
         num_rows: usize,
     },
     /// Build batches still on disk. The reservation has *not*
@@ -2615,13 +2603,11 @@ enum PartitionFinalState {
         file: RefCountedTempFile,
         // PR4-D-3 will read `num_rows` to pre-size the
         // visited-indices bitmap when materializing this slot.
-        #[allow(dead_code)]
         num_rows: usize,
         // PR4-D-3 will read `bytes` to `try_grow` the reservation
         // before readback; allowed dead in PR4-D-2 because
         // `into_flat_batches` is the only caller and it already
         // has `bytes` from the destructuring pattern.
-        #[allow(dead_code)]
         bytes: usize,
         spill_manager: Arc<SpillManager>,
     },
@@ -2724,8 +2710,12 @@ async fn collect_left_input(
         let spill_metrics =
             crate::metrics::SpillMetrics::new(&metrics_set, partition_idx);
         Some(Arc::new(
-            SpillManager::new(Arc::clone(&runtime_env), spill_metrics, Arc::clone(&schema))
-                .with_compression_type(SpillCompression::default()),
+            SpillManager::new(
+                Arc::clone(&runtime_env),
+                spill_metrics,
+                Arc::clone(&schema),
+            )
+            .with_compression_type(SpillCompression::default()),
         ))
     } else {
         None
@@ -2790,154 +2780,169 @@ async fn collect_left_input(
     //   the `multi_partition_build` gate in `execute()`); bounds-based
     //   pushdown still works through the parent `bounds`.
     let single_partition_build = num_build_partitions == 1;
-    let (partitions, _num_rows, reservation, metrics, mut bounds, membership) = if single_partition_build {
-        let (batches, finalized) = state.into_flat_batches().await?;
-        let FinalizedBuildSide {
-            num_rows,
-            metrics,
-            mut reservation,
-            bounds_accumulators,
-        } = finalized;
+    let (partitions, _num_rows, reservation, metrics, mut bounds, membership) =
+        if single_partition_build {
+            let (batches, finalized) = state.into_flat_batches().await?;
+            let FinalizedBuildSide {
+                num_rows,
+                metrics,
+                mut reservation,
+                bounds_accumulators,
+            } = finalized;
 
-        let bounds = match bounds_accumulators {
-            Some(accumulators) if num_rows > 0 => {
-                let bounds = accumulators
-                    .into_iter()
-                    .map(CollectLeftAccumulator::evaluate)
-                    .collect::<Result<Vec<_>>>()?;
-                Some(PartitionBounds::new(bounds))
-            }
-            _ => None,
-        };
-
-        let partition_data = build_partition_data(
-            batches,
-            num_rows,
-            bounds.clone(),
-            &schema,
-            &on_left,
-            &random_state,
-            null_equality,
-            with_visited_indices_bitmap,
-            &mut reservation,
-            &metrics,
-            &array_map_created_count,
-            config.execution.perfect_hash_join_small_build_threshold,
-            config.execution.perfect_hash_join_min_key_density,
-        )?;
-        let membership = compute_membership(
-            &partition_data,
-            num_rows,
-            config.optimizer.hash_join_inlist_pushdown_max_size,
-            config.optimizer.hash_join_inlist_pushdown_max_distinct_values,
-        )?;
-        (
-            vec![PartitionEntry::Resident(partition_data)],
-            num_rows,
-            reservation,
-            metrics,
-            bounds,
-            membership,
-        )
-    } else {
-        let (slots, finalized) = state.into_partition_finalize().await?;
-        let FinalizedBuildSide {
-            num_rows,
-            metrics,
-            mut reservation,
-            bounds_accumulators,
-        } = finalized;
-
-        // Parent (union) bounds — same as single-partition mode,
-        // since the accumulators saw every input batch regardless
-        // of which slot it routed to.
-        let bounds = match bounds_accumulators {
-            Some(accumulators) if num_rows > 0 => {
-                let bounds = accumulators
-                    .into_iter()
-                    .map(CollectLeftAccumulator::evaluate)
-                    .collect::<Result<Vec<_>>>()?;
-                Some(PartitionBounds::new(bounds))
-            }
-            _ => None,
-        };
-
-        let mut partitions = Vec::with_capacity(slots.len());
-        for slot in slots {
-            match slot {
-                PartitionFinalState::Resident { batches, num_rows: pnum_rows } => {
-                    // Each partition gets its own hash map built
-                    // over only that partition's rows.
-                    let partition_data = build_partition_data(
-                        batches,
-                        pnum_rows,
-                        // Per-partition bounds: PR4 v1 reuses the
-                        // parent (union) bounds for each
-                        // partition. Cheap, correct (each partition
-                        // is a subset of union), and dynamic-filter
-                        // membership pushdown is gated off in
-                        // multi-partition mode anyway. Tighter
-                        // per-partition bounds is a follow-up.
-                        bounds.clone(),
-                        &schema,
-                        &on_left,
-                        &random_state,
-                        null_equality,
-                        with_visited_indices_bitmap,
-                        &mut reservation,
-                        &metrics,
-                        &array_map_created_count,
-                        config.execution.perfect_hash_join_small_build_threshold,
-                        config.execution.perfect_hash_join_min_key_density,
-                    )?;
-                    partitions.push(PartitionEntry::Resident(partition_data));
+            let bounds = match bounds_accumulators {
+                Some(accumulators) if num_rows > 0 => {
+                    let bounds = accumulators
+                        .into_iter()
+                        .map(CollectLeftAccumulator::evaluate)
+                        .collect::<Result<Vec<_>>>()?;
+                    Some(PartitionBounds::new(bounds))
                 }
-                PartitionFinalState::Spilled {
-                    file,
-                    num_rows: pnum_rows,
-                    bytes,
-                    spill_manager,
-                } => {
-                    partitions.push(PartitionEntry::Spilled(SpilledSlot {
+                _ => None,
+            };
+
+            let partition_data = build_partition_data(
+                &batches,
+                num_rows,
+                bounds.clone(),
+                &schema,
+                &on_left,
+                &random_state,
+                null_equality,
+                with_visited_indices_bitmap,
+                &mut reservation,
+                &metrics,
+                &array_map_created_count,
+                config.execution.perfect_hash_join_small_build_threshold,
+                config.execution.perfect_hash_join_min_key_density,
+            )?;
+            let membership = compute_membership(
+                &partition_data,
+                num_rows,
+                config.optimizer.hash_join_inlist_pushdown_max_size,
+                config
+                    .optimizer
+                    .hash_join_inlist_pushdown_max_distinct_values,
+            )?;
+            (
+                vec![PartitionEntry::Resident(partition_data)],
+                num_rows,
+                reservation,
+                metrics,
+                bounds,
+                membership,
+            )
+        } else {
+            let (slots, finalized) = state.into_partition_finalize().await?;
+            let FinalizedBuildSide {
+                num_rows,
+                metrics,
+                mut reservation,
+                bounds_accumulators,
+            } = finalized;
+
+            // Parent (union) bounds — same as single-partition mode,
+            // since the accumulators saw every input batch regardless
+            // of which slot it routed to.
+            let bounds = match bounds_accumulators {
+                Some(accumulators) if num_rows > 0 => {
+                    let bounds = accumulators
+                        .into_iter()
+                        .map(CollectLeftAccumulator::evaluate)
+                        .collect::<Result<Vec<_>>>()?;
+                    Some(PartitionBounds::new(bounds))
+                }
+                _ => None,
+            };
+
+            let mut partitions = Vec::with_capacity(slots.len());
+            for slot in slots {
+                match slot {
+                    PartitionFinalState::Resident {
+                        batches,
+                        num_rows: pnum_rows,
+                    } => {
+                        // Each partition gets its own hash map built
+                        // over only that partition's rows.
+                        let partition_data = build_partition_data(
+                            &batches,
+                            pnum_rows,
+                            // Per-partition bounds: PR4 v1 reuses the
+                            // parent (union) bounds for each
+                            // partition. Cheap, correct (each partition
+                            // is a subset of union), and dynamic-filter
+                            // membership pushdown is gated off in
+                            // multi-partition mode anyway. Tighter
+                            // per-partition bounds is a follow-up.
+                            bounds.clone(),
+                            &schema,
+                            &on_left,
+                            &random_state,
+                            null_equality,
+                            with_visited_indices_bitmap,
+                            &mut reservation,
+                            &metrics,
+                            &array_map_created_count,
+                            config.execution.perfect_hash_join_small_build_threshold,
+                            config.execution.perfect_hash_join_min_key_density,
+                        )?;
+                        partitions.push(PartitionEntry::Resident(partition_data));
+                    }
+                    PartitionFinalState::Spilled {
                         file,
                         num_rows: pnum_rows,
                         bytes,
                         spill_manager,
-                        cell: tokio::sync::OnceCell::new(),
-                    }));
+                    } => {
+                        partitions.push(PartitionEntry::Spilled(SpilledSlot {
+                            file,
+                            num_rows: pnum_rows,
+                            bytes,
+                            spill_manager,
+                            cell: tokio::sync::OnceCell::new(),
+                        }));
+                    }
                 }
             }
-        }
 
-        // `membership` for filter pushdown: multi-partition mode
-        // can't represent N hash maps in `PushdownStrategy`, and
-        // `enable_dynamic_filter_pushdown` is gated off in this
-        // mode anyway. Use `Empty` as a sentinel only after
-        // confirming the build is genuinely empty; otherwise pick
-        // a never-installed strategy. Since the gate prevents
-        // installation we can pick either; choose `Empty` only
-        // when num_rows == 0 to mirror the single-partition
-        // semantics for the empty-build path.
-        let membership = if num_rows == 0 {
-            PushdownStrategy::Empty
-        } else {
-            // Sentinel: this strategy is never actually consumed
-            // because `enable_dynamic_filter_pushdown` is false in
-            // multi-partition mode. We pick the first resident map
-            // we find purely to keep the type-shape; if no slot
-            // is resident yet (everything spilled), fall back to
-            // `Empty` (still won't be consumed).
-            partitions
-                .iter()
-                .find_map(|p| match p {
-                    PartitionEntry::Resident(d) => Some(PushdownStrategy::Map(Arc::clone(&d.map))),
-                    PartitionEntry::Spilled(_) => None,
-                })
-                .unwrap_or(PushdownStrategy::Empty)
+            // `membership` for filter pushdown: multi-partition mode
+            // can't represent N hash maps in `PushdownStrategy`, and
+            // `enable_dynamic_filter_pushdown` is gated off in this
+            // mode anyway. Use `Empty` as a sentinel only after
+            // confirming the build is genuinely empty; otherwise pick
+            // a never-installed strategy. Since the gate prevents
+            // installation we can pick either; choose `Empty` only
+            // when num_rows == 0 to mirror the single-partition
+            // semantics for the empty-build path.
+            let membership = if num_rows == 0 {
+                PushdownStrategy::Empty
+            } else {
+                // Sentinel: this strategy is never actually consumed
+                // because `enable_dynamic_filter_pushdown` is false in
+                // multi-partition mode. We pick the first resident map
+                // we find purely to keep the type-shape; if no slot
+                // is resident yet (everything spilled), fall back to
+                // `Empty` (still won't be consumed).
+                partitions
+                    .iter()
+                    .find_map(|p| match p {
+                        PartitionEntry::Resident(d) => {
+                            Some(PushdownStrategy::Map(Arc::clone(&d.map)))
+                        }
+                        PartitionEntry::Spilled(_) => None,
+                    })
+                    .unwrap_or(PushdownStrategy::Empty)
+            };
+
+            (
+                partitions,
+                num_rows,
+                reservation,
+                metrics,
+                bounds,
+                membership,
+            )
         };
-
-        (partitions, num_rows, reservation, metrics, bounds, membership)
-    };
 
     if should_collect_min_max_for_phj && !should_compute_dynamic_filters {
         bounds = None;
@@ -2953,10 +2958,12 @@ async fn collect_left_input(
             null_equality,
             with_visited_indices_bitmap,
             schema: Arc::clone(&schema),
-            perfect_hash_join_small_build_threshold:
-                config.execution.perfect_hash_join_small_build_threshold,
-            perfect_hash_join_min_key_density:
-                config.execution.perfect_hash_join_min_key_density,
+            perfect_hash_join_small_build_threshold: config
+                .execution
+                .perfect_hash_join_small_build_threshold,
+            perfect_hash_join_min_key_density: config
+                .execution
+                .perfect_hash_join_min_key_density,
             array_map_created_count: array_map_created_count.clone(),
             metrics: metrics.clone(),
             runtime_env: Arc::clone(&runtime_env),
@@ -2988,9 +2995,9 @@ async fn collect_left_input(
 /// concatenated batch list, preserving PR3's bit-for-bit
 /// behavior (same `try_create_array_map` decision, same
 /// reservation accounting, same `update_hash` ordering).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn build_partition_data(
-    batches: Vec<RecordBatch>,
+    batches: &[RecordBatch],
     num_rows: usize,
     bounds: Option<PartitionBounds>,
     schema: &SchemaRef,
@@ -3004,61 +3011,60 @@ pub(super) fn build_partition_data(
     perfect_hash_join_small_build_threshold: usize,
     perfect_hash_join_min_key_density: f64,
 ) -> Result<JoinLeftPartitionData> {
-    let (join_hash_map, batch, left_values) = if let Some((array_map, batch, left_value)) =
-        try_create_array_map(
+    let (join_hash_map, batch, left_values) =
+        if let Some((array_map, batch, left_value)) = try_create_array_map(
             &bounds,
             schema,
-            &batches,
+            batches,
             on_left,
             reservation,
             perfect_hash_join_small_build_threshold,
             perfect_hash_join_min_key_density,
             null_equality,
-        )?
-    {
-        array_map_created_count.add(1);
-        metrics.build_mem_used.add(array_map.size());
-        (Map::ArrayMap(array_map), batch, left_value)
-    } else {
-        let fixed_size_u32 = size_of::<JoinHashMapU32>();
-        let fixed_size_u64 = size_of::<JoinHashMapU64>();
-
-        let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-            let estimated_hashtable_size =
-                estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-            reservation.try_grow(estimated_hashtable_size)?;
-            metrics.build_mem_used.add(estimated_hashtable_size);
-            Box::new(JoinHashMapU64::with_capacity(num_rows))
+        )? {
+            array_map_created_count.add(1);
+            metrics.build_mem_used.add(array_map.size());
+            (Map::ArrayMap(array_map), batch, left_value)
         } else {
-            let estimated_hashtable_size =
-                estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-            reservation.try_grow(estimated_hashtable_size)?;
-            metrics.build_mem_used.add(estimated_hashtable_size);
-            Box::new(JoinHashMapU32::with_capacity(num_rows))
-        };
+            let fixed_size_u32 = size_of::<JoinHashMapU32>();
+            let fixed_size_u64 = size_of::<JoinHashMapU64>();
 
-        let mut hashes_buffer = Vec::new();
-        let mut offset = 0;
-        let batches_iter = batches.iter().rev();
-        for batch in batches_iter.clone() {
-            hashes_buffer.clear();
-            hashes_buffer.resize(batch.num_rows(), 0);
-            update_hash(
-                on_left,
-                batch,
-                &mut *hashmap,
-                offset,
-                random_state,
-                &mut hashes_buffer,
-                0,
-                true,
-            )?;
-            offset += batch.num_rows();
-        }
-        let batch = concat_batches(schema, batches_iter.clone())?;
-        let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
-        (Map::HashMap(hashmap), batch, left_values)
-    };
+            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+                reservation.try_grow(estimated_hashtable_size)?;
+                metrics.build_mem_used.add(estimated_hashtable_size);
+                Box::new(JoinHashMapU64::with_capacity(num_rows))
+            } else {
+                let estimated_hashtable_size =
+                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+                reservation.try_grow(estimated_hashtable_size)?;
+                metrics.build_mem_used.add(estimated_hashtable_size);
+                Box::new(JoinHashMapU32::with_capacity(num_rows))
+            };
+
+            let mut hashes_buffer = Vec::new();
+            let mut offset = 0;
+            let batches_iter = batches.iter().rev();
+            for batch in batches_iter.clone() {
+                hashes_buffer.clear();
+                hashes_buffer.resize(batch.num_rows(), 0);
+                update_hash(
+                    on_left,
+                    batch,
+                    &mut *hashmap,
+                    offset,
+                    random_state,
+                    &mut hashes_buffer,
+                    0,
+                    true,
+                )?;
+                offset += batch.num_rows();
+            }
+            let batch = concat_batches(schema, batches_iter.clone())?;
+            let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
+            (Map::HashMap(hashmap), batch, left_values)
+        };
 
     let visited_indices_bitmap = if with_visited_indices_bitmap {
         let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
@@ -3644,8 +3650,14 @@ mod tests {
     async fn join_inner_partitioned_build_matches_single_partition() -> Result<()> {
         // Construct a TaskContext that activates the partitioned-build path.
         let mut session_config = SessionConfig::default().with_batch_size(8192);
-        session_config.options_mut().execution.hash_join_spill_threshold = 0.5;
-        session_config.options_mut().execution.hash_join_num_partitions = 4;
+        session_config
+            .options_mut()
+            .execution
+            .hash_join_spill_threshold = 0.5;
+        session_config
+            .options_mut()
+            .execution
+            .hash_join_num_partitions = 4;
         let task_ctx =
             Arc::new(TaskContext::default().with_session_config(session_config));
 
@@ -3701,8 +3713,14 @@ mod tests {
     #[tokio::test]
     async fn join_inner_partitioned_build_odd_partition_count() -> Result<()> {
         let mut session_config = SessionConfig::default().with_batch_size(8192);
-        session_config.options_mut().execution.hash_join_spill_threshold = 0.5;
-        session_config.options_mut().execution.hash_join_num_partitions = 7;
+        session_config
+            .options_mut()
+            .execution
+            .hash_join_spill_threshold = 0.5;
+        session_config
+            .options_mut()
+            .execution
+            .hash_join_num_partitions = 7;
         let task_ctx =
             Arc::new(TaskContext::default().with_session_config(session_config));
 
@@ -3712,8 +3730,7 @@ mod tests {
         let left = build_table(("a1", &keys), ("b1", &keys), ("c1", &vals));
         let right_keys: Vec<i32> = (0..16).collect();
         let right_vals: Vec<i32> = (1000..1016).collect();
-        let right =
-            build_table(("a2", &zeros), ("b1", &right_keys), ("c2", &right_vals));
+        let right = build_table(("a2", &zeros), ("b1", &right_keys), ("c2", &right_vals));
 
         let on = vec![(
             Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
@@ -3751,11 +3768,7 @@ mod tests {
             let keys: Vec<i32> = (batch_idx * 200..(batch_idx + 1) * 200).collect();
             let vals: Vec<i32> = keys.iter().map(|k| k * 10).collect();
             let payload: Vec<i32> = vec![batch_idx; 200];
-            let batch = build_table_i32(
-                ("a1", &payload),
-                ("b1", &keys),
-                ("c1", &vals),
-            );
+            let batch = build_table_i32(("a1", &payload), ("b1", &keys), ("c1", &vals));
             left_batches.push(batch);
         }
         let schema = left_batches[0].schema();
@@ -3781,8 +3794,14 @@ mod tests {
             .with_memory_limit(256 * 1024, 1.0)
             .build_arc()?;
         let mut session_config = SessionConfig::default().with_batch_size(8192);
-        session_config.options_mut().execution.hash_join_spill_threshold = 0.5;
-        session_config.options_mut().execution.hash_join_num_partitions = 4;
+        session_config
+            .options_mut()
+            .execution
+            .hash_join_spill_threshold = 0.5;
+        session_config
+            .options_mut()
+            .execution
+            .hash_join_num_partitions = 4;
         let task_ctx = Arc::new(
             TaskContext::default()
                 .with_runtime(runtime)
@@ -3839,25 +3858,22 @@ mod tests {
             ]));
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![
-                    Arc::new(Int32Array::from(keys)) as ArrayRef,
-                    payload_arr,
-                ],
+                vec![Arc::new(Int32Array::from(keys)) as ArrayRef, payload_arr],
             )?;
             left_batches.push(batch);
         }
         let left_schema = left_batches[0].schema();
-        let left =
-            TestMemoryExec::try_new_exec(&[left_batches], Arc::clone(&left_schema), None)?;
+        let left = TestMemoryExec::try_new_exec(
+            &[left_batches],
+            Arc::clone(&left_schema),
+            None,
+        )?;
 
         // Probe: 200 keys covering many build partitions, ensuring
         // most-or-all partitions get probed (and thus materialized).
         let probe_keys: Vec<i32> = (0..6400).step_by(32).collect();
-        let probe_schema = Arc::new(Schema::new(vec![Field::new(
-            "b1",
-            DataType::Int32,
-            false,
-        )]));
+        let probe_schema =
+            Arc::new(Schema::new(vec![Field::new("b1", DataType::Int32, false)]));
         let probe_batch = RecordBatch::try_new(
             Arc::clone(&probe_schema),
             vec![Arc::new(Int32Array::from(probe_keys.clone())) as ArrayRef],
@@ -3878,8 +3894,14 @@ mod tests {
             .with_memory_limit(1024 * 1024, 1.0)
             .build_arc()?;
         let mut session_config = SessionConfig::default().with_batch_size(8192);
-        session_config.options_mut().execution.hash_join_spill_threshold = 0.5;
-        session_config.options_mut().execution.hash_join_num_partitions = 16;
+        session_config
+            .options_mut()
+            .execution
+            .hash_join_spill_threshold = 0.5;
+        session_config
+            .options_mut()
+            .execution
+            .hash_join_num_partitions = 16;
         let task_ctx = Arc::new(
             TaskContext::default()
                 .with_runtime(runtime)
@@ -4043,8 +4065,14 @@ mod tests {
         }
         fn ctx_multi() -> Arc<TaskContext> {
             let mut session_config = SessionConfig::default().with_batch_size(8192);
-            session_config.options_mut().execution.hash_join_spill_threshold = 0.5;
-            session_config.options_mut().execution.hash_join_num_partitions = 4;
+            session_config
+                .options_mut()
+                .execution
+                .hash_join_spill_threshold = 0.5;
+            session_config
+                .options_mut()
+                .execution
+                .hash_join_num_partitions = 4;
             Arc::new(TaskContext::default().with_session_config(session_config))
         }
 

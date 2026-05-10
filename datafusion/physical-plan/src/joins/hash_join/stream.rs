@@ -619,8 +619,7 @@ impl HashJoinStream {
             self.build_report_state = BuildReportState::ReportDelivered;
         }
         let build_side = self.build_side.try_as_ready()?;
-        self.state =
-            Self::state_after_build_ready(build_side.left_data.as_ref());
+        self.state = Self::state_after_build_ready(build_side.left_data.as_ref());
         Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
 
@@ -770,12 +769,12 @@ impl HashJoinStream {
         // * Multi-partition mode, replay pass (or first pass after
         //   upstream is drained): take the next entry from
         //   `probe_buffer[probe_buffer_replay_idx]`.
-        let raw_batch = if self.probe_buffer.is_some() && self.probe_upstream_exhausted {
+        let raw_batch = if let Some(buf) = self
+            .probe_buffer
+            .as_ref()
+            .filter(|_| self.probe_upstream_exhausted)
+        {
             // Replay or finishing first pass after exhaust.
-            let buf = self
-                .probe_buffer
-                .as_ref()
-                .expect("checked Some above");
             if self.probe_buffer_replay_idx < buf.len() {
                 let b = buf[self.probe_buffer_replay_idx].clone();
                 self.probe_buffer_replay_idx += 1;
@@ -830,7 +829,11 @@ impl HashJoinStream {
                 num_partitions,
                 &build_side.left_data.partition_random_state,
             )?;
-            match parts.into_iter().nth(build_side.current_partition).flatten() {
+            match parts
+                .into_iter()
+                .nth(build_side.current_partition)
+                .flatten()
+            {
                 Some(b) => b,
                 None => {
                     // No probe rows route to this partition — skip
@@ -843,19 +846,12 @@ impl HashJoinStream {
 
         // Evaluate keys and (when the build map is a HashMap) hashes
         // on the routed batch.
-        let keys_values =
-            evaluate_expressions_to_arrays(&self.on_right, &routed_batch)?;
+        let keys_values = evaluate_expressions_to_arrays(&self.on_right, &routed_batch)?;
         let build_side = self.build_side.try_as_ready()?;
-        if let Map::HashMap(_) =
-            build_side.left_data.map(build_side.current_partition)
-        {
+        if let Map::HashMap(_) = build_side.left_data.map(build_side.current_partition) {
             self.hashes_buffer.clear();
             self.hashes_buffer.resize(routed_batch.num_rows(), 0);
-            create_hashes(
-                &keys_values,
-                &self.random_state,
-                &mut self.hashes_buffer,
-            )?;
+            create_hashes(&keys_values, &self.random_state, &mut self.hashes_buffer)?;
         }
 
         self.join_metrics.input_batches.add(1);
@@ -948,34 +944,34 @@ impl HashJoinStream {
         }
 
         // get the matched by join keys indices
-        let (left_indices, right_indices, next_offset) = match build_side.left_data.map(partition_idx)
-        {
-            Map::HashMap(map) => lookup_join_hashmap(
-                map.as_ref(),
-                build_side.left_data.values(partition_idx),
-                &state.values,
-                self.null_equality,
-                &self.hashes_buffer,
-                self.batch_size,
-                state.offset,
-                &mut self.probe_indices_buffer,
-                &mut self.build_indices_buffer,
-            )?,
-            Map::ArrayMap(array_map) => {
-                let next_offset = array_map.get_matched_indices_with_limit_offset(
+        let (left_indices, right_indices, next_offset) =
+            match build_side.left_data.map(partition_idx) {
+                Map::HashMap(map) => lookup_join_hashmap(
+                    map.as_ref(),
+                    build_side.left_data.values(partition_idx),
                     &state.values,
+                    self.null_equality,
+                    &self.hashes_buffer,
                     self.batch_size,
                     state.offset,
                     &mut self.probe_indices_buffer,
                     &mut self.build_indices_buffer,
-                )?;
-                (
-                    UInt64Array::from(self.build_indices_buffer.clone()),
-                    UInt32Array::from(self.probe_indices_buffer.clone()),
-                    next_offset,
-                )
-            }
-        };
+                )?,
+                Map::ArrayMap(array_map) => {
+                    let next_offset = array_map.get_matched_indices_with_limit_offset(
+                        &state.values,
+                        self.batch_size,
+                        state.offset,
+                        &mut self.probe_indices_buffer,
+                        &mut self.build_indices_buffer,
+                    )?;
+                    (
+                        UInt64Array::from(self.build_indices_buffer.clone()),
+                        UInt32Array::from(self.probe_indices_buffer.clone()),
+                        next_offset,
+                    )
+                }
+            };
 
         let distinct_right_indices_count = count_distinct_sorted_indices(&right_indices);
 
@@ -1007,7 +1003,10 @@ impl HashJoinStream {
 
         // mark joined left-side indices as visited, if required by join type
         if need_produce_result_in_final(self.join_type) {
-            let mut bitmap = build_side.left_data.visited_indices_bitmap(partition_idx).lock();
+            let mut bitmap = build_side
+                .left_data
+                .visited_indices_bitmap(partition_idx)
+                .lock();
             left_indices.iter().flatten().for_each(|x| {
                 bitmap.set_bit(x as usize, true);
             });
@@ -1055,9 +1054,17 @@ impl HashJoinStream {
         // Build output batch and push to coalescer
         let (build_batch, probe_batch, join_side) =
             if self.join_type == JoinType::RightMark {
-                (&state.batch, build_side.left_data.batch(partition_idx), JoinSide::Right)
+                (
+                    &state.batch,
+                    build_side.left_data.batch(partition_idx),
+                    JoinSide::Right,
+                )
             } else {
-                (build_side.left_data.batch(partition_idx), &state.batch, JoinSide::Left)
+                (
+                    build_side.left_data.batch(partition_idx),
+                    &state.batch,
+                    JoinSide::Left,
+                )
             };
 
         let batch = build_batch_from_indices(
@@ -1110,8 +1117,7 @@ impl HashJoinStream {
         // fires after we've drained every build partition.
         let build_side_ready = self.build_side.try_as_ready_mut()?;
         let num_partitions = build_side_ready.left_data.num_partitions();
-        if num_partitions > 1 && build_side_ready.current_partition + 1 < num_partitions
-        {
+        if num_partitions > 1 && build_side_ready.current_partition + 1 < num_partitions {
             build_side_ready.current_partition += 1;
             self.probe_buffer_replay_idx = 0;
             // Probe-buffer is fully populated only after the upstream
